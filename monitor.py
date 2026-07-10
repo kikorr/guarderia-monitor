@@ -1,9 +1,11 @@
 import os
 import io
+import re
 import json
 import time
 import random
 import logging
+import logging.handlers
 import zipfile
 import html
 from datetime import datetime, timedelta
@@ -57,28 +59,41 @@ AGENDA_INTERVAL = (25, 35)
 # (la agenda no aplica fuera de días lectivos).
 EVENING_MURO_HOUR = os.getenv("EVENING_MURO_HOUR", "22").strip()
 
+# Días que se conserva la caché de media ya enviada (es solo caché: los ficheros
+# ya están subidos a Telegram). Sin límite el volumen crece sin freno (~0.5 GB/mes).
+MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "30"))
+
+# Límite práctico de subida del Bot API (50 MB); dejamos margen.
+TG_MAX_FILE_BYTES = 49 * 1024 * 1024
+
+# Reintentos antes de dar una publicación por perdida (no marcarla vista al 1er fallo)
+PUB_MAX_ATTEMPTS = 3
+
 # Asegura que /data existe antes de configurar el log en fichero
 Path("/data").mkdir(parents=True, exist_ok=True)
 
-# --- Logging ---
+# --- Logging (rotativo: 5 MB x 3 — sin rotación el log crece sin límite 24/7) ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("guarderia")
 
+# Sesión HTTP reutilizable para Telegram (keep-alive: evita un handshake TLS por llamada)
+_tg = requests.Session()
+
 
 # --- State ---
 def load_state():
-    if STATE_FILE.exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {
+    default = {
         "pub_ids": [],
+        "baseline_done": False,
+        "pub_fail_counts": {},
         "agenda_url": None,
         "agenda_snapshot": {},
         "agenda_message_ids": [],
@@ -86,14 +101,51 @@ def load_state():
         "last_muro_check": None,
         "last_agenda_check": None,
     }
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            # state.json corrupto: apartarlo y re-baselinear (sin notificaciones)
+            log.error(f"state.json corrupto ({e}) — se aparta y se re-baselinea")
+            try:
+                STATE_FILE.replace(STATE_FILE.with_suffix(".corrupt"))
+            except OSError:
+                pass
+            return default
+        # Migración: estados antiguos sin flag — si ya hay pub_ids, el baseline se hizo
+        state.setdefault("baseline_done", bool(state.get("pub_ids")))
+        state.setdefault("pub_fail_counts", {})
+        return state
+    return default
 
 
 def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    tmp.replace(STATE_FILE)
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        tmp.replace(STATE_FILE)
+    except OSError as e:
+        # Sin esto, un disco lleno mataba el proceso en bucle (save fuera de try en el caller)
+        log.error(f"save_state FALLÓ: {e}")
+        alert_once("save-state", f"⚠️ No puedo guardar el estado del monitor ({e}). ¿Disco lleno?")
+
+
+# --- Alertas con cooldown (evita spamear Telegram con el mismo problema cada ciclo) ---
+_last_alerts = {}
+
+
+def alert_once(key, message, cooldown_min=180):
+    """Envía una alerta como máximo una vez cada cooldown_min por clave."""
+    now = datetime.now()
+    last = _last_alerts.get(key)
+    if last and (now - last) < timedelta(minutes=cooldown_min):
+        log.info(f"Alerta '{key}' suprimida (cooldown): {message}")
+        return
+    _last_alerts[key] = now
+    notify_ha("alert", message=message)
 
 
 # --- Envío de eventos: directo a Telegram (sin Home Assistant) ---
@@ -107,39 +159,67 @@ def notify_ha(event_type, **payload):
     elif event_type == "muro_video":
         tg_send_file("sendVideo", "video", MEDIA_DIR / payload["file"],
                      payload.get("caption"), TG_THREAD_MURO)
-    elif event_type in ("alert", "status"):
+    elif event_type in ("alert", "status", "session_expired"):
+        # session_expired antes caía al else y la alerta se perdía en un warning
         tg_send_message(payload.get("message", ""), TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
     else:
         log.warning(f"Evento desconocido: {event_type}")
 
 
-# --- Telegram directo (solo agenda editable - necesita delete/edit) ---
-def tg_send_message(text, thread_id, chat_id=None):
-    """Envia mensaje a Telegram y devuelve message_id. Usa TG_CHAT_ID si chat_id es None."""
-    target_chat = chat_id if chat_id is not None else TG_CHAT_ID
+# --- Telegram directo ---
+def _retry_after_seconds(response, default=5):
+    """Extrae parameters.retry_after de una respuesta 429 de Telegram."""
     try:
-        body = {"chat_id": target_chat, "text": text, "parse_mode": "HTML"}
-        if thread_id:
-            body["message_thread_id"] = int(thread_id)
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json=body,
-            timeout=30,
-        )
-        r.raise_for_status()
-        msg_id = r.json().get("result", {}).get("message_id")
-        log.info(f"TG sent message_id={msg_id} chat={target_chat} thread={thread_id}")
-        return msg_id
-    except Exception as e:
-        log.error(f"TG send error chat={target_chat} thread={thread_id}: {e}")
-        return None
+        return int(response.json().get("parameters", {}).get("retry_after", default))
+    except Exception:
+        return default
+
+
+def clip_html(msg, limit=4000):
+    """Recorta un mensaje YA escapado sin partir entidades HTML (&amp; etc. no llevan \\n ni espacios)."""
+    if len(msg) <= limit:
+        return msg
+    cut = msg[:limit]
+    for sep in ("\n", " "):
+        if sep in cut:
+            cut = cut.rsplit(sep, 1)[0]
+            break
+    return cut + "\n\n[…texto recortado]"
+
+
+def tg_send_message(text, thread_id, chat_id=None, max_retries=4):
+    """Envia mensaje a Telegram y devuelve message_id. Reintenta en 429/errores transitorios."""
+    target_chat = chat_id if chat_id is not None else TG_CHAT_ID
+    body = {"chat_id": target_chat, "text": clip_html(text), "parse_mode": "HTML"}
+    if thread_id:
+        body["message_thread_id"] = int(thread_id)
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = _tg.post(f"{TG_API}/sendMessage", json=body, timeout=30)
+            if r.status_code == 429:
+                wait = min(_retry_after_seconds(r) + 1, 60)
+                log.warning(f"TG sendMessage 429; espero {wait}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            msg_id = r.json().get("result", {}).get("message_id")
+            log.info(f"TG sent message_id={msg_id} chat={target_chat} thread={thread_id}")
+            return msg_id
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 * attempt
+                log.warning(f"TG send error chat={target_chat}: {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            log.error(f"TG send error definitivo chat={target_chat} thread={thread_id}: {e}")
+    return None
 
 
 def tg_delete_message(message_id, chat_id=None):
     """Borra un mensaje de Telegram. Usa TG_CHAT_ID si chat_id es None."""
     target_chat = chat_id if chat_id is not None else TG_CHAT_ID
     try:
-        r = requests.post(
+        r = _tg.post(
             f"{TG_API}/deleteMessage",
             json={"chat_id": target_chat, "message_id": message_id},
             timeout=10,
@@ -149,24 +229,136 @@ def tg_delete_message(message_id, chat_id=None):
         log.warning(f"TG delete error chat={target_chat} mid={message_id}: {e}")
 
 
-def tg_send_file(method, field, file_path, caption, thread_id):
-    """Sube una foto/vídeo directamente a Telegram (multipart). method=sendPhoto|sendVideo."""
-    try:
-        body = {"chat_id": TG_CHAT_ID}
-        if caption:
-            body["caption"] = caption
-            body["parse_mode"] = "HTML"
-        if thread_id:
-            body["message_thread_id"] = int(thread_id)
-        with open(file_path, "rb") as fh:
-            r = requests.post(f"{TG_API}/{method}", data=body,
-                              files={field: fh}, timeout=180)
-        r.raise_for_status()
-        log.info(f"TG {method} ok ({Path(file_path).name})")
-        return True
-    except Exception as e:
-        log.error(f"TG {method} error ({file_path}): {e}")
-        return False
+def tg_send_file(method, field, file_path, caption, thread_id, chat_id=None, max_retries=4):
+    """Sube una foto/vídeo directamente a Telegram (multipart). method=sendPhoto|sendVideo.
+    Reintenta en 429 respetando retry_after (evita perder fotos en ráfagas del muro)."""
+    body = {"chat_id": chat_id if chat_id is not None else TG_CHAT_ID}
+    if caption:
+        body["caption"] = caption
+        body["parse_mode"] = "HTML"
+    if thread_id:
+        body["message_thread_id"] = int(thread_id)
+    name = Path(file_path).name
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(file_path, "rb") as fh:
+                r = _tg.post(f"{TG_API}/{method}", data=body,
+                             files={field: fh}, timeout=180)
+            if r.status_code == 429:
+                wait = min(_retry_after_seconds(r) + 1, 60)
+                log.warning(f"TG {method} 429 rate-limit ({name}); espero {wait}s (intento {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            log.info(f"TG {method} ok ({name})")
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 * attempt
+                log.warning(f"TG {method} error ({name}): {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            log.error(f"TG {method} error definitivo ({file_path}): {e}")
+            return False
+    log.error(f"TG {method} agotados reintentos ({file_path})")
+    return False
+
+
+def tg_send_media_group(items, thread_id, chat_id=None, max_retries=4):
+    """Envía un álbum (2-10 fotos/vídeos mezclados) en UNA llamada sendMediaGroup.
+    items: lista de dicts {path: Path, kind: 'photo'|'video', caption: str|None}.
+    Un álbum de 10 fotos = 1 llamada API en vez de 10 → evita las tormentas de 429."""
+    target_chat = chat_id if chat_id is not None else TG_CHAT_ID
+    media = []
+    for i, it in enumerate(items):
+        entry = {"type": it["kind"], "media": f"attach://f{i}"}
+        if it.get("caption"):
+            entry["caption"] = it["caption"]
+            entry["parse_mode"] = "HTML"
+        media.append(entry)
+    body = {"chat_id": target_chat, "media": json.dumps(media)}
+    if thread_id:
+        body["message_thread_id"] = int(thread_id)
+    names = ", ".join(Path(it["path"]).name for it in items)
+    for attempt in range(1, max_retries + 1):
+        files = {}
+        try:
+            try:
+                files = {f"f{i}": open(it["path"], "rb") for i, it in enumerate(items)}
+                r = _tg.post(f"{TG_API}/sendMediaGroup", data=body, files=files, timeout=300)
+            finally:
+                for fh in files.values():
+                    fh.close()
+            if r.status_code == 429:
+                wait = min(_retry_after_seconds(r) + 1, 60)
+                log.warning(f"TG álbum 429; espero {wait}s (intento {attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            log.info(f"TG álbum ok ({len(items)} items: {names})")
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 3 * attempt
+                log.warning(f"TG álbum error ({names}): {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                time.sleep(wait)
+                continue
+            log.error(f"TG álbum error definitivo ({names}): {e}")
+    return False
+
+
+def chunk_albums(seq, size=10):
+    """Trocea en álbumes de hasta `size`. Si el último quedaría con 1 solo item,
+    se rebalancea (9+2) porque sendMediaGroup exige mínimo 2."""
+    chunks = [list(seq[i:i + size]) for i in range(0, len(seq), size)]
+    if len(chunks) >= 2 and len(chunks[-1]) == 1:
+        chunks[-1].insert(0, chunks[-2].pop())
+    return chunks
+
+
+def send_media_batch(media_list, thread_id, chat_id=None):
+    """Envía una lista de medias [{path, kind, caption?}] en álbumes con fallback individual.
+    Devuelve el nº de ficheros que NO se pudieron entregar."""
+    failed = 0
+    sendable = []
+    for m in media_list:
+        try:
+            size = Path(m["path"]).stat().st_size
+        except OSError:
+            failed += 1
+            continue
+        if size > TG_MAX_FILE_BYTES:
+            log.warning(f"{Path(m['path']).name}: {size / 1e6:.0f} MB > límite 50 MB del Bot API — omitido")
+            alert_once("oversize", f"⚠️ Un vídeo del muro supera los 50 MB del Bot API y no se puede enviar ({Path(m['path']).name}).", cooldown_min=720)
+            failed += 1
+            continue
+        sendable.append(m)
+
+    if not sendable:
+        return failed
+    if len(sendable) == 1:
+        m = sendable[0]
+        method, field = ("sendPhoto", "photo") if m["kind"] == "photo" else ("sendVideo", "video")
+        if not tg_send_file(method, field, m["path"], m.get("caption"), thread_id, chat_id=chat_id):
+            failed += 1
+        return failed
+
+    for chunk in chunk_albums(sendable, 10):
+        if len(chunk) == 1:
+            m = chunk[0]
+            method, field = ("sendPhoto", "photo") if m["kind"] == "photo" else ("sendVideo", "video")
+            if not tg_send_file(method, field, m["path"], m.get("caption"), thread_id, chat_id=chat_id):
+                failed += 1
+        elif not tg_send_media_group(chunk, thread_id, chat_id=chat_id):
+            # Fallback: si el álbum falla tras los reintentos, intentar los items de uno en uno
+            log.warning(f"Álbum falló — fallback individual de {len(chunk)} items")
+            for m in chunk:
+                method, field = ("sendPhoto", "photo") if m["kind"] == "photo" else ("sendVideo", "video")
+                if not tg_send_file(method, field, m["path"], m.get("caption"), thread_id, chat_id=chat_id):
+                    failed += 1
+                time.sleep(1)
+        time.sleep(3)  # respiro entre álbumes (cada álbum cuenta como N mensajes para el límite del grupo)
+    return failed
 
 
 def tg_send_agenda_to_all(text):
@@ -238,9 +430,30 @@ def next_evening_sweep():
     now = datetime.now()
     target = now.replace(hour=int(EVENING_MURO_HOUR), minute=random.randint(0, 25),
                          second=0, microsecond=0)
-    if target <= now:
+    # Si ya pasó la hora objetivo (o acabamos de barrer esta noche), programar mañana.
+    # Sin el 2º término, tras barrer a las 22:05 el jitter podía recaer a las 22:17 y repetir.
+    if target <= now or now.hour >= int(EVENING_MURO_HOUR):
         target += timedelta(days=1)
     return target
+
+
+def prune_media(days=MEDIA_RETENTION_DAYS):
+    """Borra de la caché los ficheros ya enviados con más de `days` días (el volumen crecía sin freno)."""
+    if days <= 0 or not MEDIA_DIR.exists():
+        return
+    cutoff = time.time() - days * 86400
+    n = freed = 0
+    for f in MEDIA_DIR.iterdir():
+        try:
+            st = f.stat()
+            if f.is_file() and st.st_mtime < cutoff:
+                freed += st.st_size
+                f.unlink()
+                n += 1
+        except OSError:
+            pass
+    if n:
+        log.info(f"Media prune: {n} ficheros borrados, {freed / 1e6:.0f} MB liberados")
 
 
 def daily_reset_if_needed(state):
@@ -288,8 +501,6 @@ def extract_agenda_url(soup):
 
 
 # --- Login / Session ---
-import re
-
 _session = None
 
 
@@ -326,7 +537,7 @@ def do_login():
 
         if "incorrecto" in r.text.lower():
             log.error("Login failed: credentials rejected")
-            notify_ha("alert", message="⚠️ Login Workandlife fallido. Revisa usuario/contraseña.")
+            alert_once("login-creds", "⚠️ Login Workandlife fallido. Revisa usuario/contraseña.", cooldown_min=360)
             return None
 
         log.info("Login OK")
@@ -338,20 +549,62 @@ def do_login():
 
 
 # --- Module 1: Muro del Aula ---
+_muro_fail_count = 0
+
+
+def _extract_pub_media(session, pub_id):
+    """Descarga el ZIP de una publicación y extrae sus medias a MEDIA_DIR.
+    Devuelve (media_list, skipped) o lanza excepción si la descarga/extracción falla.
+    NO envía nada: así un fallo aquí permite reintentar sin duplicar mensajes."""
+    zip_url = f"{MURO_ORIGIN}/descargar_publicacion.php?pub={pub_id}"
+    zip_resp = session.get(zip_url, timeout=120)
+    zip_resp.raise_for_status()
+    if "zip" not in zip_resp.headers.get("Content-Type", ""):
+        log.warning(f"pub={pub_id}: not a ZIP response")
+        return None, 0  # respuesta rara del servidor: sin media que extraer
+
+    media_list, skipped = [], 0
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        files = zf.namelist()
+        log.info(f"pub={pub_id}: ZIP with {len(files)} files")
+        for fname in files:
+            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            if ext in ("jpg", "jpeg", "png", "webp", "avif"):
+                kind = "photo"
+            elif ext in ("mp4", "mov", "avi", "webm"):
+                kind = "video"
+            else:
+                log.info(f"Skipping unknown file type: {fname}")
+                skipped += 1
+                continue
+            safe_name = f"muro_{pub_id[:8]}_{fname}"
+            path = MEDIA_DIR / safe_name
+            path.write_bytes(zf.read(fname))
+            media_list.append({"path": path, "kind": kind, "caption": None})
+    return media_list, skipped
+
+
 def check_muro(state, first_run=False):
-    global _session
-    log.info("Checking muro...")
+    global _session, _muro_fail_count
+    # Si el baseline inicial nunca llegó a guardarse (p.ej. fallo de red en el arranque),
+    # seguir en modo baseline: sin esto, el siguiente ciclo trataba TODO el histórico
+    # del muro como "nuevo" y lo enviaba entero a Telegram.
+    first_run = first_run or not state.get("baseline_done", False)
+    log.info("Checking muro..." + (" (baseline)" if first_run else ""))
     session = get_session()
     if not session:
-        notify_ha("alert", message="⚠️ No hay sesion activa. Error de login.")
+        alert_once("login", "⚠️ No hay sesion activa. Error de login.", cooldown_min=360)
         return
 
     try:
         resp = session.get(MURO_URL, timeout=30)
         resp.raise_for_status()
     except Exception as e:
-        log.error(f"Muro fetch error: {e}")
-        notify_ha("alert", message="⚠️ Error accediendo al muro del aula.")
+        _muro_fail_count += 1
+        log.error(f"Muro fetch error ({_muro_fail_count} seguidos): {e}")
+        # Solo alertar a partir del 2º fallo consecutivo (los hipos puntuales se auto-resuelven)
+        if _muro_fail_count >= 2:
+            alert_once("muro-fetch", "⚠️ Error accediendo al muro del aula (2+ intentos).", cooldown_min=360)
         return
 
     # Si la sesion expiro, relogin
@@ -360,14 +613,20 @@ def check_muro(state, first_run=False):
         _session = None
         session = do_login()
         if not session:
-            notify_ha("session_expired", message="⚠️ Sesión expirada y re-login fallido.")
+            alert_once("relogin", "⚠️ Sesión expirada y re-login fallido.", cooldown_min=360)
             return
-        resp = session.get(MURO_URL, timeout=30)
-        if len(resp.text) < 500:
+        try:
+            resp = session.get(MURO_URL, timeout=30)
+            resp.raise_for_status()
+        except Exception as e:
+            log.error(f"Muro refetch error tras re-login: {e}")
+            return
+        if len(resp.text) < 500 or "user-post" not in resp.text:
             log.error("Re-login did not restore access")
-            tg_send_message("⚠️ Re-login no restauró el acceso al muro.", TG_THREAD_ALERTAS)
+            alert_once("relogin", "⚠️ Re-login no restauró el acceso al muro.", cooldown_min=360)
             return
 
+    _muro_fail_count = 0
     soup = BeautifulSoup(resp.text, "html.parser")
 
     # Extraer URL de la agenda
@@ -407,15 +666,13 @@ def check_muro(state, first_run=False):
                 if len(t) > 20:
                     parts.append(t)
             post_text = "\n\n".join(parts).strip()
-            # Telegram admite 4096 chars; recortar solo si excede (margen para el encabezado)
-            if len(post_text) > 3900:
-                post_text = post_text[:3900].rsplit("\n", 1)[0] + "\n\n[…texto recortado]"
             new_pubs.append({"pub": pub_param, "text": post_text})
 
     log.info(f"Muro: {len(all_pub_ids)} publicaciones, {len(new_pubs)} nuevas")
 
     if first_run:
         state["pub_ids"] = list(all_pub_ids)
+        state["baseline_done"] = True
         log.info("Muro baseline saved")
     else:
         now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -423,46 +680,42 @@ def check_muro(state, first_run=False):
 
         for pub in new_pubs:
             pub_id = pub["pub"]
-            zip_url = f"{MURO_ORIGIN}/descargar_publicacion.php?pub={pub_id}"
+            fails = state.setdefault("pub_fail_counts", {})
+
+            # Fase 1: descargar y extraer (sin enviar nada) — si falla, se REINTENTA
+            # en el próximo ciclo en vez de marcar la publicación como vista y perderla.
             try:
-                zip_resp = session.get(zip_url, timeout=120)
-                zip_resp.raise_for_status()
-
-                if "zip" not in zip_resp.headers.get("Content-Type", ""):
-                    log.warning(f"pub={pub_id}: not a ZIP response, skipping")
-                    state.setdefault("pub_ids", []).append(pub_id)
-                    continue
-
-                with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
-                    files = zf.namelist()
-                    log.info(f"pub={pub_id}: ZIP with {len(files)} files")
-
-                    # Primero enviar el texto de la publicacion
-                    if pub["text"]:
-                        notify_ha("muro_text",
-                                  message=f"📋 <b>Nueva publicación</b> ({now_str})\n\n{html.escape(pub['text'])}")
-                        time.sleep(1)
-
-                    # Luego las fotos/videos
-                    for fname in files:
-                        data = zf.read(fname)
-                        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-                        safe_name = f"muro_{pub_id[:8]}_{fname}"
-                        (MEDIA_DIR / safe_name).write_bytes(data)
-
-                        if ext in ("jpg", "jpeg", "png", "webp", "avif"):
-                            notify_ha("muro_photo", file=safe_name, caption="")
-                        elif ext in ("mp4", "mov", "avi", "webm"):
-                            notify_ha("muro_video", file=safe_name, caption="")
-                        else:
-                            log.info(f"Skipping unknown file type: {fname}")
-
-                        time.sleep(1)
-
+                media_list, _ = _extract_pub_media(session, pub_id)
             except Exception as e:
-                log.error(f"Error downloading pub={pub_id}: {e}")
+                n = fails.get(pub_id, 0) + 1
+                fails[pub_id] = n
+                if n >= PUB_MAX_ATTEMPTS:
+                    log.error(f"pub={pub_id}: {n} intentos fallidos, se descarta: {e}")
+                    alert_once(f"pub-{pub_id}",
+                               f"⚠️ No pude descargar una publicación del muro tras {n} intentos (pub={pub_id}).")
+                    state.setdefault("pub_ids", []).append(pub_id)
+                    fails.pop(pub_id, None)
+                else:
+                    log.warning(f"pub={pub_id}: fallo de descarga (intento {n}/{PUB_MAX_ATTEMPTS}), se reintentará: {e}")
+                continue
+
+            # Fase 2: entregar. A partir de aquí marcamos vista SIEMPRE (reintentar
+            # duplicaría mensajes); los fallos parciales se avisan por alerta.
+            undelivered = 0
+            if pub["text"]:
+                msg = f"📋 <b>Nueva publicación</b> ({now_str})\n\n{html.escape(pub['text'])}"
+                if tg_send_message(msg, TG_THREAD_MURO) is None:
+                    undelivered += 1
+                time.sleep(1)
+
+            if media_list:
+                undelivered += send_media_batch(media_list, TG_THREAD_MURO)
 
             state.setdefault("pub_ids", []).append(pub_id)
+            fails.pop(pub_id, None)
+            if undelivered:
+                alert_once(f"pubsend-{pub_id}",
+                           f"⚠️ Publicación {pub_id}: {undelivered} elemento(s) no se pudieron enviar a Telegram.")
 
     state["last_muro_check"] = datetime.now().isoformat()
     save_state(state)
@@ -546,8 +799,8 @@ def build_agenda_message(snapshot):
     return "\n".join(lines)
 
 
-def parse_agenda(html):
-    soup = BeautifulSoup(html, "html.parser")
+def parse_agenda(page_html):
+    soup = BeautifulSoup(page_html, "html.parser")
     data = {}
     for item in soup.find_all("div", class_="info-item"):
         titulo_div = item.find("div", class_="info-titulo")
@@ -586,17 +839,20 @@ def check_agenda(state, first_run=False):
     try:
         resp = requests.get(agenda_url, timeout=30)
         resp.raise_for_status()
-        html = resp.content.decode("iso-8859-1")
+        page_html = resp.content.decode("iso-8859-1")
     except Exception as e:
         log.error(f"Agenda fetch error: {e}")
         return
 
-    current = parse_agenda(html)
+    current = parse_agenda(page_html)
     previous = state.get("agenda_snapshot", {})
     log.info(f"Agenda fields: {list(current.keys())}")
 
     if first_run:
         state["agenda_snapshot"] = current
+        # Sin esto, el primer daily_reset_if_needed veía last_agenda_date=None y
+        # borraba el baseline minutos después → agenda espuria el primer día.
+        state["last_agenda_date"] = datetime.now().strftime("%Y-%m-%d")
         log.info("Agenda baseline saved")
     else:
         # Comprobar si hay cambios reales
@@ -608,22 +864,30 @@ def check_agenda(state, first_run=False):
                 has_changes = True
                 break
 
+        sent_ok = True
         if has_changes:
             msg = build_agenda_message(current)
             if msg is None:
                 log.info("Agenda: changes detected but all fields still empty, skipping")
             else:
-                # Borrar mensajes anteriores (en cada destino) y enviar nuevo a todos
-                old_msg_ids = get_agenda_message_ids(state)
-                tg_delete_agenda_in_all(old_msg_ids)
-
+                # Enviar PRIMERO y borrar los antiguos después: si el envío falla,
+                # el mensaje anterior sigue en el grupo (antes se borraba antes de
+                # enviar y un fallo dejaba la agenda del día desaparecida).
                 new_ids = tg_send_agenda_to_all(msg)
-                state["agenda_message_ids"] = new_ids
-                state.pop("agenda_message_id", None)
+                if any(new_ids):
+                    old_msg_ids = get_agenda_message_ids(state)
+                    tg_delete_agenda_in_all(old_msg_ids)
+                    state["agenda_message_ids"] = new_ids
+                    state.pop("agenda_message_id", None)
+                    log.info(f"Agenda message sent/updated to {len(AGENDA_TARGETS)} target(s)")
+                else:
+                    # Snapshot NO se actualiza: el próximo ciclo verá los mismos
+                    # cambios y reintentará el envío.
+                    sent_ok = False
+                    log.error("Agenda: envío falló en todos los destinos; se reintentará en el próximo ciclo")
 
-                log.info(f"Agenda message sent/updated to {len(AGENDA_TARGETS)} target(s)")
-
-        state["agenda_snapshot"] = current
+        if sent_ok:
+            state["agenda_snapshot"] = current
 
     state["last_agenda_check"] = datetime.now().isoformat()
     save_state(state)
@@ -633,12 +897,12 @@ def check_agenda(state, first_run=False):
 def run_self_test():
     log.info("=== SELF-TEST ===")
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    tg_send_message("🧪 <b>[TEST]</b> Monitor guardería standalone — probando envío directo a Telegram…", TG_THREAD_SISTEMA)
+    tg_send_message("🧪 <b>[TEST]</b> Monitor guardería standalone — probando envío directo a Telegram…", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
     session = get_session()
     if not session:
-        tg_send_message("❌ <b>[TEST]</b> Login en Workandlife FALLÓ. Revisa WL_USER/WL_PASS.", TG_THREAD_SISTEMA)
+        tg_send_message("❌ <b>[TEST]</b> Login en Workandlife FALLÓ. Revisa WL_USER/WL_PASS.", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
         return
-    tg_send_message("✅ <b>[TEST]</b> Login OK. Buscando la última publicación del muro…", TG_THREAD_SISTEMA)
+    tg_send_message("✅ <b>[TEST]</b> Login OK. Buscando la última publicación del muro…", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
     resp = session.get(MURO_URL, timeout=30)
     soup = BeautifulSoup(resp.content, "html.parser")
     posts = soup.find_all("div", class_="user-post")
@@ -650,7 +914,7 @@ def run_self_test():
             target = (post, dl["href"].split("pub=")[-1])
             break
     if not target:
-        tg_send_message("⚠️ <b>[TEST]</b> Texto OK, pero no hay publicaciones con descarga (¿muro vacío?).", TG_THREAD_SISTEMA)
+        tg_send_message("⚠️ <b>[TEST]</b> Texto OK, pero no hay publicaciones con descarga (¿muro vacío?).", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
         return
     post, pub_id = target
     for media in post.find_all(["video", "audio", "source", "iframe"]):
@@ -666,30 +930,25 @@ def run_self_test():
             parts.append(t)
     txt = "\n\n".join(parts).strip()
     if txt:
-        tg_send_message(f"📋 <b>[TEST] Última publicación</b>\n\n{html.escape(txt)}", TG_THREAD_SISTEMA)
-    zip_url = f"{MURO_ORIGIN}/descargar_publicacion.php?pub={pub_id}"
-    zr = session.get(zip_url, timeout=120)
-    n_photo = n_video = 0
+        tg_send_message(f"📋 <b>[TEST] Última publicación</b>\n\n{html.escape(txt)}", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
+    # Ejercita el MISMO camino que producción: extracción + envío en álbumes
     try:
-        with zipfile.ZipFile(io.BytesIO(zr.content)) as zf:
-            for fname in zf.namelist():
-                ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-                p = MEDIA_DIR / f"selftest_{fname}"
-                p.write_bytes(zf.read(fname))
-                if ext in ("jpg", "jpeg", "png", "webp", "avif"):
-                    if tg_send_file("sendPhoto", "photo", p, f"🧪 [TEST] foto {n_photo + 1}", TG_THREAD_SISTEMA):
-                        n_photo += 1
-                elif ext in ("mp4", "mov", "avi", "webm"):
-                    if tg_send_file("sendVideo", "video", p, f"🧪 [TEST] vídeo {n_video + 1}", TG_THREAD_SISTEMA):
-                        n_video += 1
-                time.sleep(1)  # 1s entre envíos (anti-flood), como el flujo real
+        media_list, _ = _extract_pub_media(session, pub_id)
     except Exception as e:
         log.error(f"self-test ZIP error: {e}")
+        media_list = None
+    n_media = failed = 0
+    if media_list:
+        n_media = len(media_list)
+        if media_list:
+            media_list[0]["caption"] = "🧪 [TEST] álbum"
+        # Enviar al hilo de sistema, no al muro
+        failed = send_media_batch(media_list, TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
     tg_send_message(
         f"🧪 <b>[TEST] Resultado:</b> texto={'✅' if txt else '—'} "
-        f"· fotos={n_photo} · vídeos={n_video}\n\n"
+        f"· medios={n_media - failed}/{n_media} enviados (en álbumes)\n\n"
         f"<i>Envío self-contained de TODOS los medios de la última publicación, SIN Home Assistant.</i>",
-        TG_THREAD_SISTEMA)
+        TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
     log.info("=== SELF-TEST done ===")
 
 
@@ -703,7 +962,7 @@ def main():
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
     state = load_state()
-    first_run = not state.get("pub_ids") and not state.get("agenda_snapshot")
+    first_run = not state.get("baseline_done", False)
 
     if first_run:
         log.info("First run — baseline (no notifications)")
@@ -721,6 +980,7 @@ def main():
     next_muro = datetime.now() + random_wait((1, 3))
     next_agenda = datetime.now() + random_wait((1, 3))
     next_evening = next_evening_sweep() if EVENING_MURO_HOUR else None
+    next_prune = datetime.now() + timedelta(minutes=5)
 
     log.info(
         f"Scheduler: muro ~{MURO_INTERVAL[0]}-{MURO_INTERVAL[1]}min, "
@@ -728,38 +988,54 @@ def main():
     )
 
     while True:
-        now = datetime.now()
+        # Red de seguridad global: sin ella, cualquier excepción no prevista
+        # (red, disco, HTML inesperado) mataba el contenedor en bucle.
+        try:
+            now = datetime.now()
 
-        if is_working_time():
-            if now >= next_muro:
+            if is_working_time():
+                if now >= next_muro:
+                    state = load_state()
+                    check_muro(state)
+                    wait = random_wait(MURO_INTERVAL)
+                    next_muro = now + wait
+                    log.info(f"Next muro in {int(wait.total_seconds() / 60)}min")
+
+                if now >= next_agenda:
+                    state = load_state()
+                    daily_reset_if_needed(state)
+                    state = load_state()
+                    check_agenda(state)
+                    wait = random_wait(AGENDA_INTERVAL)
+                    next_agenda = now + wait
+                    log.info(f"Next agenda in {int(wait.total_seconds() / 60)}min")
+            else:
+                if now.hour >= 17 and next_muro < now:
+                    tomorrow_7 = (now + timedelta(days=1)).replace(hour=7, minute=0, second=0)
+                    next_muro = tomorrow_7 + random_wait((1, 10))
+                    next_agenda = tomorrow_7 + random_wait((1, 5))
+                    log.info("Outside hours. Next checks at ~07:0x tomorrow")
+
+            # Pasada nocturna del muro (cualquier día) para tardes/fines de semana
+            if next_evening and now >= next_evening:
+                log.info("Pasada nocturna del muro")
                 state = load_state()
                 check_muro(state)
-                wait = random_wait(MURO_INTERVAL)
-                next_muro = now + wait
-                log.info(f"Next muro in {int(wait.total_seconds() / 60)}min")
+                next_evening = next_evening_sweep()
+                log.info(f"Próxima pasada nocturna: {next_evening:%Y-%m-%d %H:%M}")
 
-            if now >= next_agenda:
-                state = load_state()
-                daily_reset_if_needed(state)
-                state = load_state()
-                check_agenda(state)
-                wait = random_wait(AGENDA_INTERVAL)
-                next_agenda = now + wait
-                log.info(f"Next agenda in {int(wait.total_seconds() / 60)}min")
-        else:
-            if now.hour >= 17 and next_muro < now:
-                tomorrow_7 = (now + timedelta(days=1)).replace(hour=7, minute=0, second=0)
-                next_muro = tomorrow_7 + random_wait((1, 10))
-                next_agenda = tomorrow_7 + random_wait((1, 5))
-                log.info("Outside hours. Next checks at ~07:0x tomorrow")
+            # Limpieza diaria de la caché de media
+            if now >= next_prune:
+                prune_media()
+                next_prune = now + timedelta(days=1)
 
-        # Pasada nocturna del muro (cualquier día) para tardes/fines de semana
-        if next_evening and now >= next_evening:
-            log.info("Pasada nocturna del muro")
-            state = load_state()
-            check_muro(state)
-            next_evening = next_evening_sweep()
-            log.info(f"Próxima pasada nocturna: {next_evening:%Y-%m-%d %H:%M}")
+        except Exception as e:
+            log.exception("Error no controlado en el bucle principal")
+            alert_once("main-loop", f"⚠️ Monitor guardería: error no controlado ({e}). Sigo en marcha.")
+            # No reintentar inmediatamente en bucle si el fallo es persistente
+            floor = datetime.now() + timedelta(minutes=5)
+            next_muro = max(next_muro, floor)
+            next_agenda = max(next_agenda, floor)
 
         time.sleep(30)
 

@@ -9,4 +9,4 @@ services:
     volumes:
       - ./data:/data          # estado + caché de medios (no se comparte con nadie)
     # Para probar la cadena completa sin entrar en el bucle:
-    #   SELF_TEST=1 docker compose run --rm guarderia-monitor
+    #   docker compose run --rm -e SELF_TEST=1 guarderia-monitor
