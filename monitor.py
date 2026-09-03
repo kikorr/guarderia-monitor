@@ -10,6 +10,7 @@ import zipfile
 import html
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,13 +18,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def env_or_file(name, default=""):
+    """Lee un secreto de {NAME}_FILE (Docker secret en /run/secrets) si existe;
+    si no, cae a la variable de entorno NAME. Permite sacar credenciales de
+    Config.Env (no aparecen en docker inspect). Ver project_env_to_secrets."""
+    path = os.getenv(name + "_FILE")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            pass
+    return os.getenv(name, default)
+
+
 # --- Config ---
-MURO_URL = os.getenv("MURO_URL", "https://TUCENTRO.workandlife.com/aulas/aula.php?sid=XXXX")
-WL_USER = os.getenv("WL_USER", "")
-WL_PASS = os.getenv("WL_PASS", "")
-WL_LOGIN_URL = "https://comunidaddefamilias.com"
+# NO hay URL de aula en la configuración: el centro, las aulas y la agenda se
+# descubren tras el login (ver discover_aulas). Con MURO_URL fijo, el sid del
+# curso anterior dejó de existir y el portal rebotaba a la home sin dar error:
+# el monitor llevaba días leyendo la portada creyendo que era el muro del aula.
+WL_USER = env_or_file("WL_USER")
+WL_PASS = env_or_file("WL_PASS")
+# Portal de familias de Workandlife. Es el mismo para todos los centros;
+# se deja configurable por si algún centro usa otro punto de entrada.
+WL_LOGIN_URL = os.getenv("WL_LOGIN_URL", "https://comunidaddefamilias.com").rstrip("/")
 # Telegram (envío directo, sin Home Assistant)
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_BOT_TOKEN = env_or_file("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 # Threads (temas) opcionales. Déjalos vacíos si usas un chat normal sin temas.
 TG_THREAD_MURO = os.getenv("TG_THREAD_MURO", "").strip()
@@ -42,9 +63,17 @@ AGENDA_TARGETS = [(TG_CHAT_ID, TG_THREAD_AGENDA)]
 if TG_CHAT_ID_2 and TG_THREAD_AGENDA_2:
     AGENDA_TARGETS.append((TG_CHAT_ID_2, TG_THREAD_AGENDA_2))
 
-# Origen del dominio del muro
-_parts = MURO_URL.split("/")
-MURO_ORIGIN = f"{_parts[0]}//{_parts[2]}"
+# Filtro opcional de aulas (regex sobre el nombre). Vacío = todas las que
+# devuelva el portal, que es lo que queremos por defecto.
+AULAS_INCLUDE = os.getenv("AULAS_INCLUDE", "").strip()
+
+# Hora a partir de la cual, en día lectivo, avisamos si la agenda sigue vacía.
+# 0 desactiva el aviso.
+AGENDA_EMPTY_ALERT_HOUR = int(os.getenv("AGENDA_EMPTY_ALERT_HOUR", "15") or 0)
+
+# Origen del centro (p.ej. https://TUCENTRO.workandlife.com). Se rellena en el
+# login a partir de la redirección del portal: tampoco se configura a mano.
+PORTAL_ORIGIN = ""
 
 STATE_FILE = Path("/data/state.json")
 LOG_FILE = Path("/data/monitor.log")
@@ -95,6 +124,9 @@ def load_state():
         "baseline_done": False,
         "pub_fail_counts": {},
         "agenda_url": None,
+        "aulas": {},
+        "agenda_unknown_labels": [],
+        "agenda_empty_alert_date": None,
         "agenda_snapshot": {},
         "agenda_message_ids": [],
         "last_agenda_date": None,
@@ -116,6 +148,8 @@ def load_state():
         # Migración: estados antiguos sin flag — si ya hay pub_ids, el baseline se hizo
         state.setdefault("baseline_done", bool(state.get("pub_ids")))
         state.setdefault("pub_fail_counts", {})
+        state.setdefault("aulas", {})
+        state.setdefault("agenda_unknown_labels", [])
         return state
     return default
 
@@ -513,7 +547,7 @@ def get_session():
 
 
 def do_login():
-    """Login en comunidaddefamilias.com y devuelve sesion autenticada."""
+    """Login en el portal de familias y devuelve sesion autenticada."""
     global _session
     log.info("Logging in to Workandlife...")
     s = requests.Session()
@@ -540,12 +574,161 @@ def do_login():
             alert_once("login-creds", "⚠️ Login Workandlife fallido. Revisa usuario/contraseña.", cooldown_min=360)
             return None
 
-        log.info("Login OK")
+        # El portal redirige al subdominio del centro: de ahí sale el origen,
+        # así no hay que configurarlo (ni deducirlo troceando una URL del .env).
+        global PORTAL_ORIGIN
+        PORTAL_ORIGIN = origin_of(r.url) or PORTAL_ORIGIN
+        if not PORTAL_ORIGIN:
+            log.error("Login: no pude determinar el dominio del centro")
+            return None
+
+        log.info(f"Login OK (centro: {PORTAL_ORIGIN})")
         _session = s
         return s
     except Exception as e:
         log.error(f"Login error: {e}")
         return None
+
+
+def origin_of(url):
+    """esquema://host de una URL, o "" si no se puede determinar."""
+    parts = urlsplit(url or "")
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
+
+def _looks_logged_in(resp):
+    """Marcador de sesión viva. Se usa el enlace de logout, que solo aparece
+    autenticado: el marcador anterior era 'user-post', pero un aula recién
+    creada no tiene ninguna publicación y provocaba un re-login en cada ciclo."""
+    return "/logout.php" in resp.text
+
+
+def get_authed(url, timeout=30):
+    """GET autenticado con un único re-login si la sesión ha caducado."""
+    global _session
+    session = get_session()
+    if not session:
+        return None
+    for intento in (1, 2):
+        try:
+            resp = session.get(url, timeout=timeout)
+            resp.raise_for_status()
+        except Exception as e:
+            log.error(f"GET {url} falló: {e}")
+            return None
+        if _looks_logged_in(resp):
+            return resp
+        if intento == 2:
+            log.error("Re-login no restauró el acceso al portal")
+            alert_once("relogin", "⚠️ Re-login no restauró el acceso al portal.", cooldown_min=360)
+            return None
+        log.warning("Session expired, re-login...")
+        _session = None
+        session = do_login()
+        if not session:
+            alert_once("relogin", "⚠️ Sesión expirada y re-login fallido.", cooldown_min=360)
+            return None
+    return None
+
+
+# --- Descubrimiento dinámico de aulas ---
+_AULA_SID_RE = re.compile(r"aula\.php\?sid=([^&\"'\s]+)")
+
+
+def discover_aulas():
+    """Lista viva de aulas de la familia, leída de /aulas.php tras el login.
+    Devuelve (aulas, soup) donde cada aula es {sid, name, url}. Sustituye a la
+    URL fija del .env: si el niño cambia de aula o de curso, sale sola."""
+    url = f"{PORTAL_ORIGIN}/aulas.php"
+    resp = get_authed(url)
+    if resp is None:
+        raise RuntimeError(f"no pude leer {url}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    aulas, seen = [], set()
+    for a_tag in soup.find_all("a", href=True):
+        m = _AULA_SID_RE.search(a_tag["href"])
+        if not m:
+            continue
+        sid = m.group(1)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        aulas.append({
+            "sid": sid,
+            "name": a_tag.get_text(" ", strip=True) or sid,
+            "url": urljoin(resp.url, a_tag["href"]),
+        })
+
+    if AULAS_INCLUDE:
+        try:
+            filtro = re.compile(AULAS_INCLUDE, re.IGNORECASE)
+            aulas = [a for a in aulas if filtro.search(a["name"])]
+        except re.error as e:
+            log.error(f"AULAS_INCLUDE no es una regex válida ({e}) — se ignora el filtro")
+
+    log.info(f"Aulas descubiertas: {[a['name'] for a in aulas]}")
+    return aulas, soup
+
+
+def fetch_aula(aula):
+    """Página del muro de un aula, o None si no se puede usar."""
+    resp = get_authed(aula["url"])
+    if resp is None:
+        return None
+    # Un sid que ya no existe NO da 404: el portal rebota a la home y seguiríamos
+    # leyendo el muro equivocado en silencio. Comprobarlo por la URL final.
+    if "aula.php" not in resp.url:
+        log.error(f"Aula '{aula['name']}' (sid={aula['sid']}): el portal rebota a {resp.url}")
+        alert_once(
+            f"aula-sid-{aula['sid']}",
+            f"⚠️ El aula «{html.escape(aula['name'])}» ya no existe en el portal "
+            f"(rebota a la portada). La salto; si vuelve, se re-descubre sola.",
+            cooldown_min=1440)
+        return None
+    return resp
+
+
+def report_aula_changes(state, aulas, silent=False):
+    """Avisa cuando cambia la lista de aulas (curso nuevo, alta, baja, renombrado)."""
+    current = {a["sid"]: a["name"] for a in aulas}
+    previous = state.get("aulas") or {}
+    state["aulas"] = current
+    if not previous or silent:
+        return
+    added = [n for s, n in current.items() if s not in previous]
+    removed = [n for s, n in previous.items() if s not in current]
+    renamed = [f"{previous[s]} → {n}" for s, n in current.items()
+               if s in previous and previous[s] != n]
+    if not (added or removed or renamed):
+        return
+    lines = ["🔄 <b>Cambios en las aulas del portal</b>"]
+    if added:
+        lines.append("➕ Nuevas: " + ", ".join(html.escape(x) for x in added))
+    if removed:
+        lines.append("➖ Ya no están: " + ", ".join(html.escape(x) for x in removed))
+    if renamed:
+        lines.append("✏️ Renombradas: " + ", ".join(html.escape(x) for x in renamed))
+    lines.append("<i>No hay que tocar nada: el monitor sigue las aulas que devuelve el portal.</i>")
+    notify_ha("status", message="\n".join(lines))
+
+
+def update_agenda_url(state, soup, silent=False):
+    """La agenda es por familia y su enlace está en el pie de CUALQUIER página
+    del portal, no dentro de un aula concreta: así no depende del aula."""
+    agenda_url = extract_agenda_url(soup)
+    if not agenda_url:
+        if not state.get("agenda_url"):
+            log.warning("No agenda URL found and none saved in state")
+            alert_once("agenda-url",
+                       "⚠️ No encuentro el enlace de la agenda en el portal.", cooldown_min=720)
+        return
+    old_url = state.get("agenda_url")
+    if old_url != agenda_url:
+        log.info(f"Agenda URL updated: {agenda_url}")
+        if old_url and not silent:
+            notify_ha("status", message="🔄 URL de agenda actualizada automáticamente.")
+    state["agenda_url"] = agenda_url
 
 
 # --- Module 1: Muro del Aula ---
@@ -556,7 +739,7 @@ def _extract_pub_media(session, pub_id):
     """Descarga el ZIP de una publicación y extrae sus medias a MEDIA_DIR.
     Devuelve (media_list, skipped) o lanza excepción si la descarga/extracción falla.
     NO envía nada: así un fallo aquí permite reintentar sin duplicar mensajes."""
-    zip_url = f"{MURO_ORIGIN}/descargar_publicacion.php?pub={pub_id}"
+    zip_url = f"{PORTAL_ORIGIN}/descargar_publicacion.php?pub={pub_id}"
     zip_resp = session.get(zip_url, timeout=120)
     zip_resp.raise_for_status()
     if "zip" not in zip_resp.headers.get("Content-Type", ""):
@@ -584,91 +767,84 @@ def _extract_pub_media(session, pub_id):
     return media_list, skipped
 
 
+def extract_post_text(post):
+    """Texto de una publicación del muro, sin el relleno de los reproductores."""
+    # Quitar multimedia: el <p> de fallback dentro de <video>/<audio>
+    # ("Tu navegador no implementa el elemento video.") NO es texto del post
+    for media in post.find_all(["video", "audio", "source", "iframe"]):
+        media.decompose()
+    # <br> -> salto de línea real (conserva los párrafos del post)
+    for br in post.find_all("br"):
+        br.replace_with("\n")
+    parts = []
+    for p in post.find_all("p"):
+        t = "\n".join(ln.strip() for ln in p.get_text().split("\n")).strip()
+        while "\n\n\n" in t:           # colapsa 3+ saltos a párrafo doble
+            t = t.replace("\n\n\n", "\n\n")
+        if len(t) > 20:
+            parts.append(t)
+    return "\n\n".join(parts).strip()
+
+
 def check_muro(state, first_run=False):
-    global _session, _muro_fail_count
+    global _muro_fail_count
     # Si el baseline inicial nunca llegó a guardarse (p.ej. fallo de red en el arranque),
     # seguir en modo baseline: sin esto, el siguiente ciclo trataba TODO el histórico
     # del muro como "nuevo" y lo enviaba entero a Telegram.
     first_run = first_run or not state.get("baseline_done", False)
     log.info("Checking muro..." + (" (baseline)" if first_run else ""))
-    session = get_session()
-    if not session:
+    if not get_session():
         alert_once("login", "⚠️ No hay sesion activa. Error de login.", cooldown_min=360)
         return
 
     try:
-        resp = session.get(MURO_URL, timeout=30)
-        resp.raise_for_status()
+        aulas, portal_soup = discover_aulas()
     except Exception as e:
         _muro_fail_count += 1
         log.error(f"Muro fetch error ({_muro_fail_count} seguidos): {e}")
         # Solo alertar a partir del 2º fallo consecutivo (los hipos puntuales se auto-resuelven)
         if _muro_fail_count >= 2:
-            alert_once("muro-fetch", "⚠️ Error accediendo al muro del aula (2+ intentos).", cooldown_min=360)
+            alert_once("muro-fetch", "⚠️ Error listando las aulas del portal (2+ intentos).", cooldown_min=360)
         return
 
-    # Si la sesion expiro, relogin
-    if "login" in resp.url.lower() or len(resp.text) < 500 or "user-post" not in resp.text:
-        log.warning("Session expired, re-login...")
-        _session = None
-        session = do_login()
-        if not session:
-            alert_once("relogin", "⚠️ Sesión expirada y re-login fallido.", cooldown_min=360)
-            return
-        try:
-            resp = session.get(MURO_URL, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            log.error(f"Muro refetch error tras re-login: {e}")
-            return
-        if len(resp.text) < 500 or "user-post" not in resp.text:
-            log.error("Re-login did not restore access")
-            alert_once("relogin", "⚠️ Re-login no restauró el acceso al muro.", cooldown_min=360)
-            return
+    if not aulas:
+        alert_once("aulas-vacias",
+                   "⚠️ El portal no devuelve ninguna aula. ¿Ha cambiado la web o la matrícula?",
+                   cooldown_min=720)
+        return
 
     _muro_fail_count = 0
-    soup = BeautifulSoup(resp.text, "html.parser")
+    report_aula_changes(state, aulas, silent=first_run)
+    # La agenda se saca del portal, no de un aula: así no depende de acertar con el aula.
+    update_agenda_url(state, portal_soup, silent=first_run)
 
-    # Extraer URL de la agenda
-    agenda_url = extract_agenda_url(soup)
-    if agenda_url:
-        old_url = state.get("agenda_url")
-        if old_url != agenda_url:
-            log.info(f"Agenda URL updated: {agenda_url}")
-            if old_url and not first_run:
-                notify_ha("status", message="🔄 URL de agenda actualizada automáticamente.")
-        state["agenda_url"] = agenda_url
-    elif not state.get("agenda_url"):
-        log.warning("No agenda URL found on muro page and none saved in state")
-
-    # Recoger publicaciones con su link de descarga ZIP
+    # Recoger publicaciones de TODAS las aulas descubiertas. El pub id es único
+    # en el portal, así que un post que aparezca en dos aulas no se duplica.
     all_pub_ids = set()
     new_pubs = []
-    for post in soup.find_all("div", class_="user-post"):
-        dl_link = post.find("a", href=lambda h: h and "descargar_publicacion" in h)
-        if not dl_link:
+    for aula in aulas:
+        resp = fetch_aula(aula)
+        if resp is None:
             continue
-        pub_param = dl_link["href"].split("pub=")[-1]
-        all_pub_ids.add(pub_param)
-        if pub_param not in state.get("pub_ids", []):
-            # Quitar multimedia: el <p> de fallback dentro de <video>/<audio>
-            # ("Tu navegador no implementa el elemento video.") NO es texto del post
-            for media in post.find_all(["video", "audio", "source", "iframe"]):
-                media.decompose()
-            # <br> -> salto de línea real (conserva los párrafos del post)
-            for br in post.find_all("br"):
-                br.replace_with("\n")
-            parts = []
-            for p in post.find_all("p"):
-                t = "\n".join(ln.strip() for ln in p.get_text().split("\n")).strip()
-                while "\n\n\n" in t:           # colapsa 3+ saltos a párrafo doble
-                    t = t.replace("\n\n\n", "\n\n")
-                if len(t) > 20:
-                    parts.append(t)
-            post_text = "\n\n".join(parts).strip()
-            new_pubs.append({"pub": pub_param, "text": post_text})
+        soup = BeautifulSoup(resp.text, "html.parser")
+        n_aula = 0
+        for post in soup.find_all("div", class_="user-post"):
+            dl_link = post.find("a", href=lambda h: h and "descargar_publicacion" in h)
+            if not dl_link:
+                continue
+            pub_param = dl_link["href"].split("pub=")[-1]
+            n_aula += 1
+            if pub_param in all_pub_ids:
+                continue
+            all_pub_ids.add(pub_param)
+            if pub_param not in state.get("pub_ids", []):
+                new_pubs.append({"pub": pub_param,
+                                 "text": extract_post_text(post),
+                                 "aula": aula["name"]})
+        log.info(f"  Aula '{aula['name']}': {n_aula} publicaciones")
 
-    log.info(f"Muro: {len(all_pub_ids)} publicaciones, {len(new_pubs)} nuevas")
+    log.info(f"Muro: {len(all_pub_ids)} publicaciones en {len(aulas)} aula(s), "
+             f"{len(new_pubs)} nuevas")
 
     if first_run:
         state["pub_ids"] = list(all_pub_ids)
@@ -685,7 +861,7 @@ def check_muro(state, first_run=False):
             # Fase 1: descargar y extraer (sin enviar nada) — si falla, se REINTENTA
             # en el próximo ciclo en vez de marcar la publicación como vista y perderla.
             try:
-                media_list, _ = _extract_pub_media(session, pub_id)
+                media_list, _ = _extract_pub_media(get_session(), pub_id)
             except Exception as e:
                 n = fails.get(pub_id, 0) + 1
                 fails[pub_id] = n
@@ -703,7 +879,8 @@ def check_muro(state, first_run=False):
             # duplicaría mensajes); los fallos parciales se avisan por alerta.
             undelivered = 0
             if pub["text"]:
-                msg = f"📋 <b>Nueva publicación</b> ({now_str})\n\n{html.escape(pub['text'])}"
+                origen = f" · {html.escape(pub['aula'])}" if pub.get("aula") else ""
+                msg = f"📋 <b>Nueva publicación</b>{origen} ({now_str})\n\n{html.escape(pub['text'])}"
                 if tg_send_message(msg, TG_THREAD_MURO) is None:
                     undelivered += 1
                 time.sleep(1)
@@ -756,6 +933,9 @@ AGENDA_SECTIONS = [
 ]
 SKIP_LABELS = {"Observaciones Padres", "Observaciones audio", "Horario"}
 SIN_DATOS_PATTERNS = ["sin datos disponibles", "no hay datos"]
+# Etiquetas que sabemos formatear. Cualquier otra que aparezca en la web es un
+# campo nuevo que NO se estaría enviando: por eso se avisa (ver report_agenda_changes).
+KNOWN_AGENDA_LABELS = set(FIELD_EMOJI) | SKIP_LABELS
 
 
 def is_empty_value(val):
@@ -828,6 +1008,44 @@ def parse_agenda(page_html):
     return data
 
 
+def report_agenda_changes(state, current, silent=False):
+    """Avisa si la web añade campos que el monitor no sabe formatear. Sin esto,
+    un renombrado en el portal (p.ej. "Petición de los padres" -> "de las
+    familias") se traga el campo en silencio."""
+    unknown = sorted(set(current) - KNOWN_AGENDA_LABELS)
+    already = set(state.get("agenda_unknown_labels") or [])
+    nuevos = [lab for lab in unknown if lab not in already]
+    state["agenda_unknown_labels"] = unknown
+    if not nuevos or silent:
+        return
+    notify_ha("status", message=(
+        "🆕 <b>Campos nuevos en la agenda</b>\n"
+        + "\n".join(f"  • {html.escape(lab)}" for lab in nuevos)
+        + "\n\n<i>No se están enviando todavía: hay que añadirlos a "
+          "FIELD_EMOJI y AGENDA_SECTIONS en monitor.py.</i>"))
+
+
+def alert_if_agenda_empty(state, current):
+    """Avisa una vez al día si, en día lectivo y pasada la hora tope, la agenda
+    sigue entera sin datos. La agenda dejó de llegar sin que nada lo dijera:
+    el mensaje no se envía cuando todo está vacío, así que el silencio parecía
+    normalidad."""
+    if not AGENDA_EMPTY_ALERT_HOUR or not current:
+        return
+    if not is_working_time() or datetime.now().hour < AGENDA_EMPTY_ALERT_HOUR:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("agenda_empty_alert_date") == today:
+        return
+    if any(not is_empty_value(v) for v in current.values()):
+        return
+    state["agenda_empty_alert_date"] = today
+    notify_ha("alert", message=(
+        f"⚠️ <b>Agenda vacía</b>\nHoy no hay ni un dato en la agenda "
+        f"({len(current)} campos leídos, todos «sin datos»). Si en la app sí los "
+        f"ves, algo ha cambiado en la web."))
+
+
 def check_agenda(state, first_run=False):
     agenda_url = state.get("agenda_url")
     if not agenda_url:
@@ -847,6 +1065,16 @@ def check_agenda(state, first_run=False):
     current = parse_agenda(page_html)
     previous = state.get("agenda_snapshot", {})
     log.info(f"Agenda fields: {list(current.keys())}")
+
+    if not current:
+        log.error("Agenda: la página no devuelve ningún campo reconocible")
+        alert_once("agenda-parse",
+                   "⚠️ No consigo leer ningún campo de la agenda. ¿Ha cambiado la web?",
+                   cooldown_min=720)
+    else:
+        report_agenda_changes(state, current, silent=first_run)
+        if not first_run:
+            alert_if_agenda_empty(state, current)
 
     if first_run:
         state["agenda_snapshot"] = current
@@ -902,19 +1130,37 @@ def run_self_test():
     if not session:
         tg_send_message("❌ <b>[TEST]</b> Login en Workandlife FALLÓ. Revisa WL_USER/WL_PASS.", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
         return
-    tg_send_message("✅ <b>[TEST]</b> Login OK. Buscando la última publicación del muro…", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
-    resp = session.get(MURO_URL, timeout=30)
-    soup = BeautifulSoup(resp.content, "html.parser")
-    posts = soup.find_all("div", class_="user-post")
-    log.info(f"self-test: {len(posts)} publicaciones")
+    try:
+        aulas, portal_soup = discover_aulas()
+    except Exception as e:
+        tg_send_message(f"❌ <b>[TEST]</b> Login OK pero no pude listar las aulas: {html.escape(str(e))}",
+                        TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
+        return
+    nombres = ", ".join(html.escape(a["name"]) for a in aulas) or "(ninguna)"
+    agenda_url = extract_agenda_url(portal_soup)
+    tg_send_message(
+        f"✅ <b>[TEST]</b> Login OK en {html.escape(PORTAL_ORIGIN)}\n"
+        f"🏫 Aulas descubiertas: {nombres}\n"
+        f"📋 Agenda: {'✅ enlace encontrado' if agenda_url else '❌ no encontrada'}",
+        TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
+
     target = None
-    for post in posts:
-        dl = post.find("a", href=lambda h: h and "descargar_publicacion" in h)
-        if dl:
-            target = (post, dl["href"].split("pub=")[-1])
+    for aula in aulas:
+        resp = fetch_aula(aula)
+        if resp is None:
+            continue
+        soup = BeautifulSoup(resp.content, "html.parser")
+        posts = soup.find_all("div", class_="user-post")
+        log.info(f"self-test: aula '{aula['name']}', {len(posts)} publicaciones")
+        for post in posts:
+            dl = post.find("a", href=lambda h: h and "descargar_publicacion" in h)
+            if dl:
+                target = (post, dl["href"].split("pub=")[-1])
+                break
+        if target:
             break
     if not target:
-        tg_send_message("⚠️ <b>[TEST]</b> Texto OK, pero no hay publicaciones con descarga (¿muro vacío?).", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
+        tg_send_message("⚠️ <b>[TEST]</b> Login OK, pero ningún aula tiene publicaciones con descarga (¿muros vacíos?).", TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
         return
     post, pub_id = target
     for media in post.find_all(["video", "audio", "source", "iframe"]):

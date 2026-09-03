@@ -9,11 +9,22 @@ deposiciones, observaciones…). **Autocontenido: no necesita Home Assistant ni 
 > siguiendo esta guía paso a paso. Cada familia corre su propia copia con sus
 > credenciales: **tus datos no salen de tu máquina**.
 
+**Solo necesita tu usuario y contraseña.** No hay que copiar URLs ni ids de aula:
+al entrar descubre solo el centro, **todas** las aulas que te muestra el portal y
+el enlace de la agenda. Si tu peque cambia de aula o empieza curso nuevo, se
+entera él solo y te avisa del cambio.
+
 ## ¿Qué recibirás en Telegram?
 
-- 📋 **Muro**: cada publicación nueva → el texto + todas sus fotos/vídeos (en álbumes de hasta 10).
+- 📋 **Muro**: cada publicación nueva → el texto + todas sus fotos/vídeos (en álbumes de hasta 10),
+  con el nombre del aula de la que viene.
 - 🗓️ **Agenda diaria**: un único mensaje al día que se va actualizando solo (borra el anterior y manda el nuevo).
-- ⚠️ **Avisos**: si el login falla o algo se rompe, el bot te lo dice (sin spamear).
+- ⚠️ **Avisos**, sin spamear:
+  - cambian las aulas del portal (alta, baja o renombrado),
+  - un aula deja de existir y el portal empieza a devolver otra cosa,
+  - la web añade o renombra campos de la agenda que el monitor todavía no sabe mostrar,
+  - la agenda del día sigue vacía a media tarde en día lectivo,
+  - el login falla o algo se rompe.
 
 Comprueba el muro cada ~1h y la agenda cada ~30min, solo en horario lectivo
 (L-V 07:00–17:00, ignora festivos nacionales), con intervalos aleatorios para no
@@ -80,15 +91,7 @@ Puedes recibirlo en un **chat privado** con el bot o en un **grupo familiar**
 
 > 💡 Si `getUpdates` sale vacío (`"result":[]`), manda otro mensaje y recarga la página.
 
-## Paso 3 — La URL del aula de tu peque
-
-1. Entra en la web de **Workandlife** de tu guardería con tu usuario y contraseña
-   (la misma que usas en el móvil/navegador).
-2. Ve al **muro del aula** de tu hijo/a.
-3. Copia la **URL completa** de la barra del navegador. Tiene esta pinta:
-   `https://TUCENTRO.workandlife.com/aulas/aula.php?sid=XXXX`
-
-## Paso 4 — Descargar este proyecto
+## Paso 3 — Descargar este proyecto
 
 **Sin git (más fácil):** en la página de GitHub del proyecto pulsa
 **Code → Download ZIP**, descomprímelo donde quieras (ej. `Documentos\guarderia-monitor`).
@@ -99,7 +102,7 @@ git clone https://github.com/kikorr/guarderia-monitor.git
 cd guarderia-monitor
 ```
 
-## Paso 5 — Configurar tus datos (.env)
+## Paso 4 — Configurar tus datos (.env)
 
 En la carpeta del proyecto hay un fichero `.env.example`. Hay que copiarlo como `.env`
 y rellenarlo.
@@ -118,32 +121,38 @@ cp .env.example .env
 nano .env
 ```
 
-Rellena como mínimo estas 5 líneas con lo que has ido recopilando:
+Rellena estas **4 líneas** con lo que has ido recopilando:
 ```ini
 WL_USER=tu_usuario_de_workandlife
 WL_PASS=tu_contraseña_de_workandlife
-MURO_URL=https://TUCENTRO.workandlife.com/aulas/aula.php?sid=XXXX
 TG_BOT_TOKEN=123456789:AAExxxxxxxxxxxxxxxxxxxxxx
 TG_CHAT_ID=-1001234567890
 ```
-El resto de opciones son opcionales (explicadas más abajo). Guarda y cierra.
+Y ya está: **el aula no se configura**, la encuentra él. El resto de opciones son
+opcionales (explicadas más abajo). Guarda y cierra.
 
-## Paso 6 — Probar que todo funciona (self-test)
+## Paso 5 — Probar que todo funciona (self-test)
 
-Antes de dejarlo en marcha, prueba la cadena completa (login + lectura del muro +
-envío a Telegram). En la carpeta del proyecto (mismo comando en Windows y Linux):
+Antes de dejarlo en marcha, prueba la cadena completa (login + descubrimiento de
+aulas + lectura del muro + envío a Telegram). En la carpeta del proyecto
+(mismo comando en Windows y Linux):
 
 ```bash
 docker compose run --rm -e SELF_TEST=1 guarderia-monitor
 ```
 
 La primera vez tardará unos minutos (descarga y construye la imagen). Después
-deberías recibir en Telegram varios mensajes `🧪 [TEST]` y **la última publicación
-real del muro con sus fotos/vídeos en álbumes**. Si llega → ¡funciona! 🎉
+deberías recibir en Telegram varios mensajes `🧪 [TEST]`, incluyendo **la lista de
+aulas que ha encontrado** y **la última publicación real del muro con sus
+fotos/vídeos en álbumes**. Si llega → ¡funciona! 🎉
+
+> 👀 Mira la lista de aulas del mensaje de test: ahí debería salir la de tu peque.
+> Si sale alguna de más que no te interesa, puedes filtrarlas con `AULAS_INCLUDE`
+> (ver *Opciones avanzadas*).
 
 Si algo falla, mira la sección **Solución de problemas** más abajo.
 
-## Paso 7 — Arrancarlo definitivamente
+## Paso 6 — Arrancarlo definitivamente
 
 ```bash
 docker compose up -d --build
@@ -173,6 +182,28 @@ proyecto. La caché se limpia sola (se conservan 30 días).
 
 ---
 
+# 🔎 Qué hace solo (y por qué)
+
+Cada vez que entra, el monitor:
+
+1. **Averigua tu centro** a partir de la redirección del login, en vez de tenerlo escrito.
+2. **Lee la lista de aulas** de `aulas.php` y las recorre todas. Una misma publicación
+   que aparezca en dos aulas se envía una sola vez.
+3. **Saca el enlace de la agenda** del pie del portal. Ese enlace es **por familia**,
+   no por aula, así que no depende de acertar con el aula.
+4. **Compara la lista de aulas con la de la última vez** y te avisa si algo cambió.
+
+Esto no es un capricho: el portal cambia el identificador del aula cada curso, y una
+URL de aula caducada **no da error** — el portal te devuelve la portada como si tal
+cosa. Con el aula escrita a mano en la configuración, el monitor se pasaba días
+leyendo la portada creyendo que era el muro, sin que nadie se enterara. Ahora esa
+situación se detecta y se avisa.
+
+> ⬆️ **¿Vienes de una versión anterior?** Ya no hace falta `MURO_URL` en tu `.env`;
+> si sigue ahí, se ignora. Puedes borrar esa línea.
+
+---
+
 # ⚙️ Opciones avanzadas (todas opcionales, en el .env)
 
 ### Grupo con "Temas" (Topics)
@@ -184,14 +215,31 @@ temas distintos:
 3. Rellena `TG_THREAD_MURO`, `TG_THREAD_AGENDA` y `TG_THREAD_SISTEMA` con los ids.
    Para un chat/grupo normal **déjalos vacíos**.
 
+### Seguir solo algunas aulas
+`AULAS_INCLUDE`: por defecto sigue **todas** las aulas que te muestra el portal. Si
+solo quieres algunas, pon una expresión regular que case con su nombre, por ejemplo
+`Cervatillo|Comunicados`. Vacío = todas (recomendado).
+
+### Aviso de agenda vacía
+`AGENDA_EMPTY_ALERT_HOUR=15`: hora a partir de la cual, en día lectivo, te avisa una
+vez si la agenda del día sigue completamente vacía. Como el mensaje de agenda no se
+envía cuando no hay ningún dato, sin este aviso un fallo se confunde con "hoy no han
+escrito nada". `0` lo desactiva.
+
 ### Avisos del sistema a otro chat
 `SISTEMA_CHAT_ID`: si quieres que los avisos técnicos (login caído, etc.) vayan a un
 chat distinto del familiar (p.ej. solo a ti), pon aquí su chat id.
+
+### Contraseñas en ficheros (Docker secrets)
+Cualquier variable sensible admite el sufijo `_FILE` apuntando a un fichero, en vez de
+ir en el `.env`: `WL_USER_FILE`, `WL_PASS_FILE`, `TG_BOT_TOKEN_FILE`. Útil si usas
+Docker secrets y no quieres que las credenciales aparezcan en `docker inspect`.
 
 ### Otras
 - `EVENING_MURO_HOUR=22` → hora de la pasada nocturna del muro (vacío = desactivarla).
 - `MEDIA_RETENTION_DAYS=30` → días que se conserva la caché local de fotos/vídeos.
 - `TG_CHAT_ID_2` + `TG_THREAD_AGENDA_2` → enviar la agenda además a un segundo grupo.
+- `WL_LOGIN_URL` → punto de entrada del portal (por defecto `https://comunidaddefamilias.com`).
 - `TZ=Europe/Madrid` → zona horaria.
 
 ---
@@ -201,6 +249,12 @@ chat distinto del familiar (p.ej. solo a ti), pon aquí su chat id.
 | Síntoma | Causa probable y arreglo |
 |---|---|
 | `[TEST] Login en Workandlife FALLÓ` | Usuario/contraseña mal en el `.env`. Prueba a entrar en la web a mano con esos mismos datos. |
+| `[TEST] Login OK pero no pude listar las aulas` | El portal respondió raro o cambió. Reintenta; si persiste, abre un issue. |
+| El test dice `Aulas descubiertas: (ninguna)` | Tu cuenta no tiene aulas asignadas en el portal. Compruébalo entrando a la web a mano. |
+| No sale el aula de mi peque en la lista | ¿Tienes `AULAS_INCLUDE` puesto? Déjalo vacío para seguirlas todas. |
+| Aviso `El aula X ya no existe en el portal` | Normal en cambio de curso: el monitor la salta y sigue con las nuevas. No hay que tocar nada. |
+| Aviso `Campos nuevos en la agenda` | La web renombró o añadió un campo. El monitor sigue funcionando pero no muestra ese campo; abre un issue con el nombre que te ha dicho. |
+| Aviso `Agenda vacía` todos los días | Si en la web sí ves datos, la página ha cambiado: abre un issue. Si tampoco los ves ahí, es que la guardería no la rellena. |
 | No llega nada a Telegram y en el log sale `400 Bad Request` | `TG_CHAT_ID` mal (¿olvidaste el `-100` de los grupos?), el bot **no está dentro del grupo**, o pusiste `TG_THREAD_*` de un tema que no existe en ese chat. |
 | `getUpdates` sale vacío | Mándale un mensaje al bot (o menciónalo en el grupo) y recarga. |
 | `chat not found` | El bot no ha sido iniciado (chat privado: dale a "Iniciar") o no está en el grupo. |
@@ -219,6 +273,10 @@ chat distinto del familiar (p.ej. solo a ti), pon aquí su chat id.
 - **¿Y si el bot se cae o se reinicia el equipo?** Se levanta solo (`restart: unless-stopped`)
   y retoma donde iba: no repite publicaciones ya enviadas, y las que no pudo descargar
   las reintenta hasta 3 veces.
+- **¿Y cuando mi peque cambie de aula o de curso?** No tienes que hacer nada: lo detecta
+  al siguiente ciclo y te manda un aviso contándote qué ha cambiado.
+- **¿Sigue las aulas de mis dos hijos?** Sigue todas las aulas que tu cuenta ve en el
+  portal, así que sí, siempre que ambos cuelguen de la misma cuenta de familia.
 - **¿Funciona con cualquier guardería?** Solo con las que usan la plataforma
   **Workandlife** (portal `comunidaddefamilias.com` / `*.workandlife.com`).
 
