@@ -10,13 +10,17 @@ NO debe registrar una entrada.
 Como funciona la web (medido con el enlace del QR, en solo lectura):
   - GET  {URL_QR}                                 -> sesion (cookie); el HTML dice centro id y coordenadas
   - POST pages/compruebaUser.php   id=<centro>     -> formulario de DNI (o, con cookie, la ficha del padre)
-  - POST pages/compruebaPadre.php  dni=..&idCentro -> ficha: padre, alumnos (.chk_alu), botones entrada/salida
-  - POST actions/hacer_fichaje.php (multipart: campos del form fRegistro + padre, idCentro, tipo=1)
+  - POST pages/compruebaPadre.php  dni=..&idCentro -> ficha: un bloque por nino (.cont_hijos con su
+                                                      .chk_alu y el texto "Entrada: HH:MM"/"Salida: HH:MM")
+                                                      y un unico boton #btn_alu (padre, centro, tipo_web)
+  - POST actions/hacer_fichaje.php (multipart: chk_<id>=<idAlumno> de los ninos + padre, idCentro, tipo=1)
     -> JSON {"Resultado": "OK"|..., "Descripcion": "..."}
   La comprobacion de distancia la hace SOLO el navegador (JavaScript); el servidor no
   recibe coordenadas. Por eso aqui no hay geolocalizacion que simular.
-  OJO: la ficha que sale tras el DNI NUNCA se ha visto de verdad; _parse_ficha es una
-  suposicion a partir del JavaScript. Ante cualquier duda NO ficha y avisa.
+  La ficha real se vio el 23-sep-2026 (con entrada y salida ya hechas) y _parse_ficha sigue esa
+  estructura; el caso "sin entrada todavia" (sin el <li>Entrada:>) y el tipo_web que trae el
+  boton por la manana son suposiciones razonables, no vistas. Ante cualquier duda NO ficha y avisa.
+  Nunca se guardan ni se envian nombres: solo ids, horas y el numero de ninos.
 
 Reglas de seguridad (revision 23-sep-2026):
   - Un "Si" solo vale si responde a una pregunta de HOY (message_id en asked_msg_ids),
@@ -33,10 +37,13 @@ un oyente (getUpdates) por bot y el de HA ya lo ocupa.
 Estado en /data/fichaje.json: cookies de la web, offset de Telegram, fechas de
 pregunta/respuesta/fichaje. Todo lo importante se registra en el log del monitor.
 """
+import html as _html
 import json
 import logging
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -127,6 +134,9 @@ DEBUG_HTML = STATE_FILE.parent / "fichaje_ultimo.html"
 UA = "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Mobile Safari/537.36"
 
 ENABLED = bool(URL_QR and DNI and BOT_TOKEN and CHAT_ID)
+# Escucha de botones en un hilo propio (ronda 5). FICHAJE_HILO=0 la desactiva y tick() vuelve a
+# leer los botones cada 30 s (modo antiguo; lo usan las pruebas y sirve de plan B).
+HILO = os.getenv("FICHAJE_HILO", "1").strip() != "0"
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
@@ -160,7 +170,7 @@ def _err(e):
 # ── estado ────────────────────────────────────────────────────────────────────
 def load_state():
     d = {"cookies": {}, "tg_offset": 0, "tg_primed": False,
-         "si_pendiente": False, "si_msg_id": None, "si_quien": None,
+         "si_pendiente": False, "si_msg_id": None, "si_quien": None, "si_texto_base": None,
          "err_fichar": 0, "err_fichar_until": None, "q_date": None, "q_envios": 0,
          "aviso_pendiente": None,
          "asked_date": None, "asked_msg_ids": [], "reminded_date": None,
@@ -333,106 +343,109 @@ def _ficha_padre(st, s, centro):
     return html
 
 
+_RE_ENTRADA = re.compile(r"Entrada:\s*(\d{1,2}:\d{2})")
+_RE_SALIDA = re.compile(r"Salida:\s*(\d{1,2}:\d{2})")
+
+
 def _parse_ficha(html):
+    """Lee la ficha del padre tal como es de verdad (vista el 23-sep-2026 21:10):
+
+    - Un solo boton #btn_alu (data-fn="guardaAccesoAlumno", data-p1=padre, data-p2=centro,
+      data-p3=tipo). El TIPO lo decide el servidor (tipo_web); no hay botones de entrada/salida.
+    - form#fRegistro con un input.chk_alu por nino (name=chk_<id>, value=<idAlumno>,
+      data-ausente). El HTML NO trae 'checked' (los marca el JS al cargar); una casilla
+      'disabled' es un nino que ya no admite registro (p. ej. entrada y salida hechas).
+    - El estado del dia va en TEXTO dentro de div.cont_hijos: <li>Entrada: HH:MM - ...</li> y
+      <li>Salida: HH:MM - ...</li>. Sin entrada, ese li no existe.
+    Aqui NO se guarda ningun nombre: solo ids, banderas y horas."""
     soup = BeautifulSoup(html, "html.parser")
-    info = {"texto": _limpia(_texto(html)[:600]), "padre": None, "alumnos": [], "marcados": [],
-            "ausentes": [], "chk_name": None, "entrada": False, "salida": False, "form": {},
-            "error": None, "error_tipo": None}
-    form = soup.find("form", id="fRegistro")
-    if form:
-        for inp in form.find_all("input"):
-            n = inp.get("name")
-            if not n:
-                continue
-            t = (inp.get("type") or "text").lower()
-            if t == "checkbox":
-                if "chk_alu" in (inp.get("class") or []):
-                    v = inp.get("value")
-                    info["chk_name"] = n
-                    info["alumnos"].append(v)                   # se listan todos
-                    if str(inp.get("data-ausente", "0")) == "1":
-                        info["ausentes"].append(v)
-                    if inp.has_attr("checked"):                 # al form, solo los marcados
-                        info["marcados"].append(v)
-                        info["form"].setdefault(n, []).append(v)
-                elif inp.has_attr("checked"):
-                    info["form"][n] = inp.get("value", "on")
-            elif t == "radio":
-                if inp.has_attr("checked"):
-                    info["form"][n] = inp.get("value", "on")
-            elif t not in ("submit", "button", "reset", "image", "file"):
-                info["form"][n] = inp.get("value", "")
-    # botones: data-fn="guardaAccesoAlumno" con data-p1=padre data-p2=centro data-p3=tipo, o un onclick
-    for el in soup.find_all(attrs={"data-fn": re.compile("guardaAcceso")}):
-        ps = [el.get(f"data-p{i}") for i in (1, 2, 3)]
-        if ps[0] and info["padre"] is None:
-            info["padre"] = ps[0]
-        if ps[2] == "1":
-            info["entrada"] = True
-        if ps[2] == "2":
-            info["salida"] = True
-    for el in soup.find_all(attrs={"onclick": re.compile("guardaAcceso")}):
-        m = re.search(r"guardaAcceso\w*\(\s*'?(\w+)'?\s*,\s*'?(\w+)'?\s*,\s*'?(\d)'?", el["onclick"])
-        if m:
-            info["padre"] = info["padre"] or m.group(1)
-            info["entrada"] = info["entrada"] or m.group(3) == "1"
-            info["salida"] = info["salida"] or m.group(3) == "2"
-    # el id de padre en un hidden sirve para FICHAR, no prueba que ya este fichado
-    hid = soup.find("input", id="idUser") or soup.find("input", attrs={"name": "padre"})
-    if hid and hid.get("value") and info["padre"] is None:
-        info["padre"] = hid.get("value")
-    if "DNI" in info["texto"] and "introduce" in info["texto"].lower():
+    texto = _texto(html)
+    info = {"padre": None, "centro_web": None, "tipo_web": None, "alumnos": [], "pendientes": [],
+            "hecho": False, "error": None, "error_tipo": None}
+    for chk in soup.find_all("input", class_="chk_alu"):
+        caja = chk.find_parent("div", class_="cont_hijos") or chk.parent
+        t = caja.get_text(" ") if caja else ""
+        me, ms = _RE_ENTRADA.search(t), _RE_SALIDA.search(t)
+        aid = chk.get("value") or (re.search(r"(\d+)$", chk.get("id") or "") or [None, None])[1]
+        info["alumnos"].append({
+            "id": aid,
+            "campo": chk.get("name") or f"chk_{aid}",           # nombre del campo en el multipart
+            "disabled": chk.has_attr("disabled"),
+            "ausente": str(chk.get("data-ausente", "0")).strip() == "1",
+            "entrada": me.group(1) if me else None,
+            "salida": ms.group(1) if ms else None,
+        })
+    # boton: #btn_alu con data-p1/2/3; se aceptan tambien otros data-fn guardaAcceso* o un onclick
+    btn = soup.find(id="btn_alu") or soup.find(attrs={"data-fn": re.compile("guardaAcceso")})
+    if btn is not None and btn.get("data-p1"):
+        info["padre"], info["centro_web"], info["tipo_web"] = (btn.get("data-p1"), btn.get("data-p2"),
+                                                               (btn.get("data-p3") or "").strip() or None)
+    else:
+        for el in soup.find_all(attrs={"onclick": re.compile("guardaAcceso")}):
+            m = re.search(r"guardaAcceso\w*\(\s*'?(\w+)'?\s*,\s*'?(\w+)'?\s*,\s*'?(\d)'?", el["onclick"])
+            if m:
+                info["padre"], info["centro_web"], info["tipo_web"] = m.group(1), m.group(2), m.group(3)
+                break
+    presentes = [a for a in info["alumnos"] if not a["ausente"]]
+    info["pendientes"] = [a["id"] for a in presentes if not a["entrada"] and not a["disabled"]]
+    if "DNI" in texto and "introduce" in texto.lower():
         info["error_tipo"] = "dni"
         info["error"] = "la web sigue pidiendo el DNI: ¿DNI incorrecto, sesion del QR caducada o falta aceptar las cookies (FICHAJE_COOKIES_EXTRA)?"
-    elif not info["entrada"] and not info["salida"]:
+    elif not info["alumnos"]:
         info["error_tipo"] = "botones"
-        info["error"] = "la ficha no muestra botones de entrada ni salida, mírala tú"
-    # tres estados: hecho solo si ofrece salida y ya no entrada
-    info["hecho"] = bool(info["salida"] and not info["entrada"] and not info["error"])
+        info["error"] = "la ficha no lista alumnos, mírala tú"
+    elif not info["padre"]:
+        info["error_tipo"] = "botones"
+        info["error"] = "la ficha no muestra el botón de registro, mírala tú"
+    else:
+        # hecho = todos los ninos no ausentes tienen hora de entrada (todos ausentes: nada que fichar)
+        info["hecho"] = all(a["entrada"] for a in presentes)
+        if not info["hecho"] and not info["pendientes"]:
+            info["error_tipo"] = "botones"
+            info["error"] = "hay niños sin entrada pero la ficha no deja marcarlos, mírala tú"
+        elif not info["hecho"] and info["tipo_web"] != "1":
+            info["error_tipo"] = "tipo"
+            info["error"] = (f"la web propone un registro de tipo {info['tipo_web']}, no una entrada; "
+                             "no ficho, mírala tú")
     return info
 
 
 def estado(st):
-    """Consulta la web. Devuelve (hecho, info). hecho=True solo si la ficha ofrece SALIDA y no ENTRADA."""
+    """Consulta la web. Devuelve (hecho, info). hecho=True si todos los ninos no ausentes tienen entrada."""
     s = _session(st)
     centro = _login(st, s)
     info = _parse_ficha(_ficha_padre(st, s, centro))
     info["centro"] = centro
-    hecho = info["hecho"]
+    hecho = bool(info["hecho"]) and not info["error"]
     st["last_estado"] = {"cuando": datetime.now().isoformat(timespec="seconds"), "hecho": hecho,
-                         "entrada": info["entrada"], "salida": info["salida"],
-                         "alumnos": len(info["alumnos"]), "marcados": len(info["marcados"]),
-                         "error": info["error"]}
+                         "alumnos": len(info["alumnos"]), "pendientes": len(info["pendientes"]),
+                         "tipo_web": info["tipo_web"], "error": info["error"]}
     save_state(st)
     return hecho, info
 
 
+class FichajeNoTransitorio(FichajeError):
+    """Error que no se arregla reintentando: se avisa y se deja el dia (como 'sin botones')."""
+
+
 def fichar(st, info):
-    """Ficha la ENTRADA (tipo 1) de los alumnos marcados y no ausentes. Devuelve (ok, mensaje)."""
+    """Ficha la ENTRADA (tipo 1) de los ninos pendientes (sin entrada, no ausentes, casilla activa).
+    Devuelve (ok, mensaje) o lanza FichajeError (transitorio) / FichajeNoTransitorio."""
     if info.get("error"):
-        return False, info["error"]
+        if info.get("error_tipo") == "dni":
+            raise FichajeError(info["error"])
+        raise FichajeNoTransitorio(info["error"])
     if not info.get("padre"):
-        return False, "no encuentro el id del padre en la ficha"
-    if not info.get("alumnos"):
-        return False, "la ficha no lista ningun alumno"
-    ausentes = set(info.get("ausentes") or [])
-    elegidos = [a for a in (info.get("marcados") or []) if a not in ausentes]
-    if not elegidos:
-        return False, ("ningún alumno viene marcado y presente en la ficha "
-                       f"({len(info['alumnos'])} listados, {len(ausentes)} ausentes); no ficho")
-    chk = info.get("chk_name")
-    reservadas = {"padre", "idCentro", "tipo"}
-    data = []
-    for k, v in info["form"].items():
-        if k in reservadas or k == chk:
-            continue
-        if isinstance(v, list):
-            data += [(k, x) for x in v]
-        else:
-            data.append((k, v))
-    if chk:
-        data += [(chk, a) for a in elegidos]
-    data += [("padre", info["padre"]), ("idCentro", info["centro"]), ("tipo", "1")]
+        raise FichajeNoTransitorio("no encuentro el id del padre en la ficha")
+    if info.get("tipo_web") != "1":
+        raise FichajeNoTransitorio(f"la web propone un registro de tipo {info.get('tipo_web')}, "
+                                   "no una entrada; no ficho")
+    pendientes = list(info.get("pendientes") or [])
+    if not pendientes:
+        raise FichajeNoTransitorio("no hay ningún niño pendiente de entrada que se pueda marcar")
+    campos = {a["id"]: a["campo"] for a in info.get("alumnos") or []}
+    data = [(campos.get(a) or f"chk_{a}", a) for a in pendientes]      # como $('.chk_alu:checked')
+    data += [("padre", info["padre"]), ("idCentro", info.get("centro_web") or info["centro"]), ("tipo", "1")]
     files = [(k, (None, str(v))) for k, v in data]   # multipart, como FormData del navegador
     s = _session(st)
     r = s.post(_base() + "/fichajes_padres/actions/hacer_fichaje.php", files=files, timeout=30)
@@ -441,10 +454,22 @@ def fichar(st, info):
         j = r.json()
     except Exception:
         return False, f"respuesta no JSON (HTTP {r.status_code})"
-    ok = str(j.get("Resultado", "")).upper() == "OK"
-    if ok:
-        _borra_debug_html()
-    return ok, _limpia(str(j.get("Descripcion") or j.get("Resultado") or "sin descripcion"))[:300]
+    desc = _limpia(str(j.get("Descripcion") or j.get("Resultado") or "sin descripcion"))[:300]
+    if str(j.get("Resultado", "")).upper() != "OK":
+        return False, desc
+    # comprobacion: la ficha debe mostrar ahora la entrada de esos ninos. Si no, NO se reintenta el POST.
+    try:
+        _, info2 = estado(st)
+        horas = {a["id"]: a["entrada"] for a in info2.get("alumnos") or []}
+        faltan = [a for a in pendientes if not horas.get(a)]
+    except Exception as e:
+        log.error(f"fichaje: no pude releer la ficha tras fichar: {_err(e)}")
+        faltan = pendientes
+    if faltan:
+        raise FichajeNoTransitorio("la web dice OK pero la ficha no muestra la entrada, míralo tú")
+    _borra_debug_html()
+    n = len(pendientes)
+    return True, f"{desc} ({n} niño{'s' if n != 1 else ''}, entrada comprobada en la ficha)"
 
 
 # ── Telegram (bot propio) ─────────────────────────────────────────────────────
@@ -497,10 +522,39 @@ def _quitar_botones(msg_ids):
 
 
 def _answer(cb_id, text):
+    """Respuesta al toque (el aviso flotante). Caduca a los pocos segundos: por eso el feedback
+    que de verdad se ve es la edicion del mensaje (_marcar_pulsado)."""
     try:
         _tg("answerCallbackQuery", callback_query_id=cb_id, text=text[:180])
     except Exception as e:
-        log.warning(f"fichaje: answerCallbackQuery: {_err(e)}")
+        resp = getattr(e, "response", None)
+        cuerpo = ""
+        try:
+            cuerpo = (resp.text or "").lower() if resp is not None else ""
+        except Exception:
+            pass
+        if getattr(resp, "status_code", None) == 400 and ("too old" in cuerpo or "query id is invalid" in cuerpo):
+            log.debug(f"fichaje: answerCallbackQuery caducado ({_err(e)})")     # normal si se tarda
+        else:
+            log.warning(f"fichaje: answerCallbackQuery: {_err(e)}")
+
+
+def _texto_pulsado(msg, linea):
+    base = _html.escape(msg.get("text") or "")
+    return (base + "\n" if base else "") + linea
+
+
+def _marcar_pulsado(msg, linea):
+    """Edita el mensaje pulsado: su texto original + una linea con lo que se ha hecho, y sin botones
+    (editMessageText sin reply_markup los quita). Devuelve el texto nuevo (HTML)."""
+    nuevo = _texto_pulsado(msg, linea)
+    _edit(msg.get("message_id"), nuevo)
+    return nuevo
+
+
+def _con_base(st, linea):
+    base = st.get("si_texto_base")
+    return f"{base}\n{linea}" if base else linea
 
 
 BOTONES = [{"text": "✅ Sí, ficha", "callback_data": "fichar_si"},
@@ -535,8 +589,10 @@ def _es_timeout(e):
 
 
 def preguntar(st, hoy, motivo=""):
+    n = st.get("pendientes_n")
+    cuantos = (f"\n{n} niño{'s' if n != 1 else ''} sin entrada." if isinstance(n, int) and n > 0 else "")
     txt = ("🚪 <b>Guardería: hoy no hay entrada fichada</b>" + (f" ({motivo})" if motivo else "") +
-           "\n¿Ficho yo la entrada de hoy? Si el niño no ha ido, pulsa No.")
+           cuantos + "\n¿Ficho yo la entrada de hoy? Si no han ido, pulsa No.")
     if st.get("q_date") != hoy:
         st["q_date"], st["q_envios"] = hoy, 0
     if (st.get("q_envios") or 0) >= MAX_PREGUNTAS_DIA:
@@ -586,12 +642,13 @@ def _procesar_callback(st, cb, now=None):
         _answer(cb["id"], "Este chat no es el del fichaje.")
         return
     hoy = now.strftime("%Y-%m-%d")
-    quien = (cb.get("from") or {}).get("first_name", "alguien")
+    quien = _html.escape((cb.get("from") or {}).get("first_name", "alguien"))
+    hhmm = datetime.now().strftime("%H:%M")      # hora real de proceso (now puede ser simulado)
     if data in ("test_si", "test_no"):
         if st.get("test_date") != hoy or msg_id not in (st.get("test_msg_ids") or []):
             return _caducada(cb, msg_id, "prueba de otro dia o mensaje desconocido")
         _answer(cb["id"], "Prueba recibida, no hago nada.")
-        _edit(msg_id, f"🧪 Prueba del bot: {quien} pulsó «{'sí' if data == 'test_si' else 'no'}». Los botones llegan bien.")
+        _marcar_pulsado(msg, f"→ prueba recibida: {'Sí' if data == 'test_si' else 'No'} ({quien}) · {hhmm}")
         st["test_msg_ids"] = [m for m in st["test_msg_ids"] if m != msg_id]
         save_state(st)
         log.info(f"fichaje: prueba de botones OK ({data})")
@@ -612,9 +669,9 @@ def _procesar_callback(st, cb, now=None):
         st["answer"], st["answer_date"] = "no", hoy
         save_state(st)
         _answer(cb["id"], "Vale, hoy no se ficha.")
-        _edit(msg_id, f"❌ Hoy no se ficha (dijo {quien}).")
+        _marcar_pulsado(msg, f"→ No, hoy no ({quien}) · {hhmm}")
         _quitar_botones(otros)
-        log.info(f"fichaje: {quien} dijo NO")
+        log.info("fichaje: respuesta NO")
         return
     # fichar_si: se marca la respuesta ANTES de tocar la web (en memoria y en disco), para que un
     # segundo toque no fiche otra vez; si_pendiente sobrevive a un reinicio y tick() lo reintenta.
@@ -631,8 +688,11 @@ def _procesar_callback(st, cb, now=None):
         log.error("fichaje: Si recibido pero el estado no se guarda; no ficho hasta poder escribir")
         return "reintentar"
     _answer(cb["id"], "Fichando…")
+    st["si_texto_base"] = _texto_pulsado(msg, f"→ Sí ({quien}) · {hhmm}")
+    _edit(msg_id, st["si_texto_base"] + "\n⏳ fichando…")      # quita los botones al momento
+    save_state(st)
     _quitar_botones(otros)
-    log.info(f"fichaje: {quien} dijo SI")
+    log.info("fichaje: respuesta SI")
     _intentar_fichar(st, now, hoy)
 
 
@@ -641,8 +701,9 @@ def _intentar_fichar(st, now, hoy):
 
     Hueco conocido (BAJA-4, ronda 3): entre un POST correcto y el save_state que apunta done_date,
     si el proceso muere, al reiniciar si_pendiente sigue True y se reintenta. La UNICA defensa
-    contra el doble fichaje en ese caso es estado()/_parse_ficha: que la ficha ya no ofrezca
-    ENTRADA (hecho=True). Como esa ficha nunca se ha visto de verdad, es una suposicion."""
+    contra el doble fichaje en ese caso es estado()/_parse_ficha: que la ficha muestre ya la hora
+    de ENTRADA de esos ninos (hecho=True). Estructura vista de verdad el 23-sep; el caso "sin
+    entrada todavia" (sin <li>Entrada:>) es una suposicion razonable, no se ha visto."""
     quien = st.get("si_quien") or "alguien"
     if st.get("done_date") == hoy:
         ok, texto = True, "ya constaba la entrada de hoy"
@@ -650,21 +711,32 @@ def _intentar_fichar(st, now, hoy):
         try:
             hecho, info = estado(st)
             ok, texto = (True, "ya constaba la entrada de hoy") if hecho else fichar(st, info)
+        except FichajeNoTransitorio as e:
+            # no se arregla reintentando (tipo de registro raro, ficha sin boton, OK sin entrada
+            # visible...): se deja el Si, se dice en el mensaje y se avisa a Sistema. Sin mas POST.
+            texto = _err(e).replace("FichajeNoTransitorio ", "")
+            st["si_pendiente"] = False
+            save_state(st)
+            log.error(f"fichaje: no ficho ({texto})")
+            _edit(st.get("si_msg_id"), _con_base(st, f"⚠️ <b>No he fichado</b> ({quien} dijo sí): {texto}\n"
+                                       "Míralo en la web o hazlo desde la puerta."))
+            _avisar(st, f"⚠️ Guardería (fichaje): {texto}")
+            return False
         except Exception as e:
             ok, texto = False, f"error hablando con la web: {_err(e)}"
     if ok:
         st["done_date"] = hoy
         st["si_pendiente"] = False
         save_state(st)
-        _edit(st.get("si_msg_id"), f"✅ <b>Entrada fichada</b> ({quien} dijo sí): {texto}")
+        _edit(st.get("si_msg_id"), _con_base(st, f"✅ <b>Entrada fichada</b> ({quien} dijo sí): {texto}"))
         log.info(f"fichaje: entrada fichada: {texto}")
         return True
     if _fallo(st, now, hoy, texto, tipo="fichar"):
-        _edit(st.get("si_msg_id"), f"⚠️ <b>No he podido fichar</b> ({quien} dijo sí) tras "
-                                   f"{MAX_ERRORES_DIA} intentos: {texto}\nHabrá que hacerlo desde la puerta.")
+        _edit(st.get("si_msg_id"), _con_base(st, f"⚠️ <b>No he podido fichar</b> ({quien} dijo sí) tras "
+                                   f"{MAX_ERRORES_DIA} intentos: {texto}\nHabrá que hacerlo desde la puerta."))
     else:
-        _edit(st.get("si_msg_id"), f"⏳ {quien} dijo sí, pero aún no he podido fichar: {texto}\n"
-                                   f"Lo reintento en 10 min ({st['err_fichar']}/{MAX_ERRORES_DIA}).")
+        _edit(st.get("si_msg_id"), _con_base(st, f"⏳ {quien} dijo sí, pero aún no he podido fichar: {texto}\n"
+                                   f"Lo reintento en 10 min ({st['err_fichar']}/{MAX_ERRORES_DIA})."))
     return False
 
 
@@ -675,7 +747,7 @@ def _cerrar_si_pendiente(st):
     st["si_pendiente"] = False
     save_state(st)
     log.error(f"fichaje: el Si del {fecha} no se llego a fichar; lo cierro")
-    _edit(st.get("si_msg_id"), f"⚠️ <b>No pude fichar</b> la entrada del {fecha} ({quien} dijo sí).")
+    _edit(st.get("si_msg_id"), _con_base(st, f"⚠️ <b>No pude fichar</b> la entrada del {fecha} ({quien} dijo sí)."))
     _avisar(st, f"⚠️ Guardería: {quien} dijo sí el {fecha}, pero no pude fichar la entrada. Revisa la ficha.")
 
 
@@ -749,38 +821,134 @@ def _reintentar_aviso(st):
     save_state(st)
 
 
-def poll_telegram(st, now=None):
-    """Lee las pulsaciones de los botones del bot propio. Nunca lanza."""
+def _get_updates(offset, espera):
+    return _tg("getUpdates", _timeout=(5, espera + 10), offset=offset, timeout=espera,
+               allowed_updates=["callback_query"]) or []
+
+
+def poll_telegram(st, now=None, espera=0, lanzar=False):
+    """Lee las pulsaciones del bot propio y las procesa. La espera larga (long polling) va FUERA del
+    lock; el procesado, DENTRO (asi el hilo y tick() no pisan el estado a la vez). Sin lanzar=True
+    nunca lanza (modo tick); el hilo pide lanzar=True para gestionar el backoff y el 409."""
+    with _LOCK:
+        primed = st.get("tg_primed")
+        offset = (st.get("tg_offset") or 0) + 1
     try:
-        if not st.get("tg_primed"):
+        if not primed:
             # primer arranque: descartar lo pendiente (callbacks de hasta 24 h) sin procesarlo
-            upd = _tg("getUpdates", _timeout=(5, 10), offset=-1, timeout=0,
-                      allowed_updates=["callback_query"]) or []
-            if upd:
-                st["tg_offset"] = max(u["update_id"] for u in upd)
-            st["tg_primed"] = True
-            save_state(st)
+            upd = _get_updates(-1, 0)
+            with _LOCK:
+                if upd:
+                    st["tg_offset"] = max(u["update_id"] for u in upd)
+                st["tg_primed"] = True
+                save_state(st)
             log.info("fichaje: primer arranque, descartados los botones pendientes en Telegram")
             return
-        upd = _tg("getUpdates", _timeout=(5, 10), offset=(st.get("tg_offset") or 0) + 1, timeout=0,
-                  allowed_updates=["callback_query"]) or []
+        upd = _get_updates(offset, espera)
     except Exception as e:
+        if lanzar:
+            raise
         _warn_throttled("getUpdates", f"fichaje: getUpdates: {_err(e)}")
         return
-    for u in upd:
-        if not _save_ok:
-            # el estado no se esta guardando: no proceso mas; estos updates vuelven en el siguiente poll
-            break
-        prev = st.get("tg_offset") or 0
-        try:
-            st["tg_offset"] = max(prev, u["update_id"])
-            if "callback_query" in u and _procesar_callback(st, u["callback_query"], now) == "reintentar":
-                st["tg_offset"] = prev          # no se confirma: Telegram lo reentregara
+    with _LOCK:
+        if upd and st is _ST:
+            _estado_memoria()                   # recoge un test-bot enviado durante la espera larga
+        for u in upd:
+            if not _save_ok:
+                # el estado no se esta guardando: no proceso mas; estos updates vuelven en el siguiente poll
                 break
-        except Exception as e:
-            log.error(f"fichaje: error procesando un boton: {_err(e)}")
-    if upd:
-        save_state(st)
+            prev = st.get("tg_offset") or 0
+            if u.get("update_id", 0) <= prev:
+                continue                        # ya procesado (p. ej. por el modo tick)
+            try:
+                st["tg_offset"] = max(prev, u["update_id"])
+                if "callback_query" in u and _procesar_callback(st, u["callback_query"], now) == "reintentar":
+                    st["tg_offset"] = prev          # no se confirma: Telegram lo reentregara
+                    break
+            except Exception as e:
+                log.error(f"fichaje: error procesando un boton: {_err(e)}")
+        if upd:
+            save_state(st)
+
+
+# ── hilo de escucha de botones (ronda 5) ──────────────────────────────────────
+# Motivo: con tick() cada 30 s una pulsacion tardaba hasta 30 s en procesarse; el
+# answerCallbackQuery caducaba ("query is too old") y no se veia nada. El hilo hace long polling
+# (getUpdates timeout=20) y procesa al momento. Todo acceso a _ST va bajo _LOCK, tambien en tick().
+# Nota: mientras se ficha (web, hasta ~1 min) el lock esta cogido y tick() espera; es a proposito
+# (garantiza un solo POST) y ocurre como mucho una vez al dia.
+_LOCK = threading.RLock()
+_hilo = None
+_parar = threading.Event()             # solo para pruebas
+_relanzamientos = []                   # instantes en que tick() relanzo el hilo (tope por hora)
+MAX_RELANZ_HORA = 3
+ESPERA_LARGA = 20                      # s de long polling
+
+
+def _escucha_una_vez():
+    """Una vuelta del hilo. Nunca lanza. Devuelve cuantos segundos esperar antes de la siguiente."""
+    try:
+        with _LOCK:
+            st = _estado_memoria()
+            if not _save_ok:
+                save_state(st)
+            disco_ok = _save_ok
+        if not disco_ok:
+            return 30                  # sin poder guardar no se procesan botones
+        poll_telegram(st, None, espera=ESPERA_LARGA, lanzar=True)
+        _escucha_una_vez.backoff = 5
+        return 0
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        if getattr(resp, "status_code", None) == 409:
+            log.warning("fichaje: getUpdates 409 Conflict (otro oyente del mismo bot, p. ej. 'fichaje.py poll'); espero 30 s")
+            return 30
+        espera = getattr(_escucha_una_vez, "backoff", 5)
+        _warn_throttled("hilo", f"fichaje: escucha de botones: {_err(e)}; reintento en {espera} s")
+        _escucha_una_vez.backoff = min(espera * 2, 60)
+        return espera
+
+
+_escucha_una_vez.backoff = 5
+
+
+def _bucle_escucha():
+    log.info("fichaje: escucha de botones en marcha")
+    while not _parar.is_set():
+        try:
+            espera = _escucha_una_vez()
+        except BaseException:          # ni siquiera un fallo raro aqui tumba el hilo
+            espera = 60
+        if espera:
+            _parar.wait(espera)
+
+
+def _hilo_vivo():
+    return _hilo is not None and _hilo.is_alive()
+
+
+def _arrancar_hilo():
+    global _hilo
+    _hilo = threading.Thread(target=_bucle_escucha, name="fichaje-botones", daemon=True)
+    _hilo.start()
+
+
+def _asegurar_hilo(now):
+    """Desde tick(): arranca el hilo la primera vez y lo relanza si ha muerto (max 3 por hora)."""
+    if not (ENABLED and HILO) or _hilo_vivo():
+        return
+    if _hilo is None:
+        _arrancar_hilo()
+        return
+    hace_una_hora = now - timedelta(hours=1)
+    _relanzamientos[:] = [t for t in _relanzamientos if t > hace_una_hora]
+    if len(_relanzamientos) >= MAX_RELANZ_HORA:
+        _warn_throttled("hilo-muerto", f"fichaje: el hilo de botones ha muerto {len(_relanzamientos)} veces "
+                                       "en la ultima hora; no lo relanzo, leo los botones desde tick()")
+        return
+    log.warning("fichaje: el hilo de botones estaba muerto; lo relanzo")
+    _relanzamientos.append(now)
+    _arrancar_hilo()
 
 
 # ── entrada desde el bucle principal del monitor ──────────────────────────────
@@ -823,6 +991,7 @@ def _decidir(st, now, hoy, es_dia_lectivo):
             log.warning(f"fichaje: {info['error']}")
             _avisar(st, f"⚠️ Guardería (fichaje): {info['error']}")
         else:
+            st["pendientes_n"] = len(info.get("pendientes") or [])   # solo el numero, nunca nombres
             preguntar(st, hoy)
     elif (st.get("asked_date") == hoy and st.get("answer") is None and RECORDATORIO_MIN
           and st.get("done_date") != hoy and st.get("reminded_date") != hoy
@@ -837,40 +1006,42 @@ def tick(now, es_dia_lectivo):
     if not ENABLED:
         return
     try:
-        st = _estado_memoria()
-        hoy = now.strftime("%Y-%m-%d")
-        if st.get("err_date") != hoy:
-            st["err_date"] = hoy
-            st["err_count"], st["err_until"], st["err_fichar"], st["err_fichar_until"] = 0, None, 0, None
-        if not _save_ok:
-            save_state(st)                       # reintenta escribir; si sigue fallando, sin botones
-        if _save_ok:
-            poll_telegram(st, now)
-        _reintentar_aviso(st)
-        try:
-            _decidir(st, now, hoy, es_dia_lectivo)
-        except Exception as e:
-            _fallo(st, now, hoy, _err(e), tipo="estado")
+        with _LOCK:
+            st = _estado_memoria()               # el estado se carga ANTES de arrancar el hilo
+            hoy = now.strftime("%Y-%m-%d")
+            if st.get("err_date") != hoy:
+                st["err_date"] = hoy
+                st["err_count"], st["err_until"], st["err_fichar"], st["err_fichar_until"] = 0, None, 0, None
+            if not _save_ok:
+                save_state(st)                   # reintenta escribir; si sigue fallando, sin botones
+        _asegurar_hilo(now)
+        if _save_ok and not _hilo_vivo():
+            poll_telegram(st, now)               # modo antiguo: sin hilo (FICHAJE_HILO=0 o tope de relanzamientos)
+        with _LOCK:
+            _reintentar_aviso(st)
+            try:
+                _decidir(st, now, hoy, es_dia_lectivo)
+            except Exception as e:
+                _fallo(st, now, hoy, _err(e), tipo="estado")
     except Exception as e:                       # ultimo cinturon: nada de fichaje llega al monitor
         log.error(f"fichaje: error inesperado en tick: {_err(e)}")
 
 
 # ── uso manual: docker exec guarderia-monitor python fichaje.py estado|fichar|test-bot|poll ──
 # estado y fichar escriben fichaje.json (cookies, last_estado); fichar es un Si explicito SIN pregunta.
-# poll es de SOLO LECTURA: lista lo pendiente sin avanzar el offset ni procesar (quien ficha es el monitor).
-if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "estado"
-    if not ENABLED:
-        print("fichaje deshabilitado: faltan URL, DNI, token del bot o chat_id"); sys.exit(2)
+# poll es de SOLO LECTURA: lista lo pendiente sin avanzar el offset ni procesar (quien ficha es el monitor);
+# con el monitor en marcha puede dar 409 (dos oyentes del mismo bot): inocuo. test-bot solo envia.
+def _cli(cmd):
     st = load_state()
     if cmd == "estado":
         hecho, info = estado(st)
-        print(json.dumps({"hecho": hecho, **{k: v for k, v in info.items() if k != "form"},
-                          "form_campos": list(info["form"].keys())}, ensure_ascii=False, indent=2))
+        # sin nombres: ids, banderas y horas; padre/centro solo como "presente"
+        print(json.dumps({"hecho": hecho, "tipo_web": info.get("tipo_web"), "padre": bool(info.get("padre")),
+                          "alumnos": info.get("alumnos"), "pendientes": info.get("pendientes"),
+                          "error": info.get("error"), "error_tipo": info.get("error_tipo")},
+                         ensure_ascii=False, indent=2))
     elif cmd == "fichar":
-        # manual y explicito (lo teclea kiko): equivale a un Si
+        # manual y explicito (lo teclea kiko): equivale a un Si, SIN pregunta
         hecho, info = estado(st)
         print("ya hecho" if hecho else fichar(st, info))
     elif cmd == "test-bot":
@@ -885,9 +1056,26 @@ if __name__ == "__main__":
         print(f"enviado, message_id={r.get('message_id') if r else None}")
     elif cmd == "poll":
         # offset = el ya confirmado por el monitor + 1: no confirma nada nuevo ni procesa botones
-        upd = _tg("getUpdates", _timeout=(5, 10), offset=(st.get("tg_offset") or 0) + 1, timeout=0,
-                  allowed_updates=["callback_query"]) or []
+        # timeout=0 y sin allowed_updates (no cambia el filtro del bot). Con el monitor en marcha su
+        # hilo esta en long polling y esto puede dar 409 Conflict: es inocuo, basta repetirlo.
+        upd = _tg("getUpdates", _timeout=(5, 10), offset=(st.get("tg_offset") or 0) + 1, timeout=0) or []
         print(f"{len(upd)} pendientes (offset guardado {st.get('tg_offset')})")
         for u in upd:
             cq = u.get("callback_query") or {}
             print(f"  update {u.get('update_id')}: {cq.get('data')!r} en mensaje {(cq.get('message') or {}).get('message_id')}")
+    else:
+        print("uso: python fichaje.py estado|fichar|test-bot|poll")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    if not ENABLED:
+        print("fichaje deshabilitado: faltan URL, DNI, token del bot o chat_id"); sys.exit(2)
+    try:
+        sys.exit(_cli(sys.argv[1] if len(sys.argv) > 1 else "estado"))
+    except Exception as e:      # nunca el traceback: requests lo imprime con la URL bot<token> o ?p=
+        print(f"error: {_err(e)}", file=sys.stderr)
+        sys.exit(1)

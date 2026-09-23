@@ -254,13 +254,32 @@ Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
 
 - A `FICHAJE_HORA` de un día lectivo mira la web. Si ya hay entrada, no hace nada. Si
   falta, pregunta; si nadie contesta, repite una vez a los `FICHAJE_RECORDATORIO_MIN`.
+- **Los botones responden al momento**: el monitor escucha el bot en un hilo propio
+  (long polling). Al pulsar, el mensaje se edita: desaparecen los botones y se añade una
+  línea «→ Sí (Nombre) · hh:mm», «→ No, hoy no (Nombre) · hh:mm» o, en la prueba,
+  «→ prueba recibida: Sí/No (Nombre) · hh:mm». Tras un «Sí» se ve «⏳ fichando…» y luego
+  el resultado.
 - **Nunca ficha sin un «Sí» explícito y vigente**: el botón tiene que ser de la pregunta
   de hoy, sin respuesta previa y dentro de las 3 h siguientes a `FICHAJE_HORA`. Un botón
   viejo contesta «Pregunta caducada». Un día de enfermedad o vacaciones basta con pulsar No
   (o no contestar).
-- Ficha solo los alumnos que la web trae **marcados y no ausentes**. Si la ficha no
-  muestra botones de entrada ni salida, o sigue pidiendo el DNI, no ficha y avisa
-  (al tema/chat de Sistema si lo tienes).
+- **Cómo sabe si ya hay entrada.** Tras el DNI, la web muestra una ficha con un bloque
+  por niño; si ya se ha registrado algo, debajo del nombre aparece `Entrada: HH:MM …` y/o
+  `Salida: HH:MM …`. El día cuenta como **hecho** cuando todos los niños que no están
+  marcados como ausentes tienen hora de entrada.
+- **Qué ficha.** Solo los niños **pendientes**: sin hora de entrada, no ausentes
+  (`data-ausente="1"`) y con la casilla activa (la web la desactiva cuando ya no admite
+  registro, p. ej. con entrada y salida hechas). La pregunta dice cuántos niños faltan,
+  sin nombres. Envía lo mismo que el navegador: la casilla de cada niño pendiente
+  (`chk_<id>`), el padre, el centro y `tipo=1`.
+- **`tipo_web`.** La ficha tiene un único botón «Realizar registro» y el tipo de
+  registro lo decide la web (1 = entrada). Si propone otro tipo, **no ficha** y avisa.
+- Tras un «OK» de la web vuelve a leer la ficha y comprueba que ya sale la entrada; si
+  no sale, no repite el envío y avisa («la web dice OK pero la ficha no muestra la
+  entrada, míralo tú»).
+- Si la ficha no lista niños, no tiene el botón de registro o hay niños sin entrada que
+  no se pueden marcar, avisa (al tema/chat de Sistema si lo tienes) y deja el día. Si
+  sigue pidiendo el DNI, lo trata como un fallo pasajero (ver más abajo).
 - **Usa un bot propio**, distinto de `TG_BOT_TOKEN`: Telegram solo deja a un programa
   escuchar los botones de un bot (`getUpdates`), y si el bot ya lo usa otro sistema (p. ej.
   Home Assistant) se pisarían. Crea otro bot con @BotFather y añádelo al grupo.
@@ -281,7 +300,8 @@ Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
 | `FICHAJE_COOKIES_EXTRA` | Cookies que añadir a la sesión, `nombre=valor;nombre2=valor2` (ver abajo). |
 | `FICHAJE_CENTRO` | Id del centro en la web de fichajes. Vacío = se lee de la página del QR (rellénalo solo si esa lectura falla). |
 | `FICHAJE_STATE` | Fichero de estado (por defecto `/data/fichaje.json`). |
-| `FICHAJE_DEBUG` | `1` guarda el último HTML de la ficha en `/data/fichaje_ultimo.html` (permisos 0600; se borra tras un fichaje correcto). |
+| `FICHAJE_HILO` | `0` desactiva el hilo de escucha y los botones se leen cada 30 s desde el bucle (modo antiguo, para pruebas). Por defecto activo. |
+| `FICHAJE_DEBUG` | `1` guarda el último HTML de la ficha en `/data/fichaje_ultimo.html` (permisos 0600; se borra tras un fichaje comprobado). Contiene nombres: no lo compartas. |
 
 Si falta la URL, el DNI, el token o el chat, el módulo queda **desactivado** (el log lo dice al arrancar).
 El estado (`/data/fichaje.json`) guarda las cookies de la web y se escribe con permisos 0600.
@@ -303,11 +323,16 @@ Las variables `_FILE` mandan sobre la variable normal (igual que en el resto del
 un fichero vacío o ilegible deja el fichaje desactivado sin tumbar el monitor.
 
 Comandos manuales dentro del contenedor (`docker exec guarderia-monitor python fichaje.py …`):
-- `estado`: qué ve en la web. Escribe `fichaje.json` (cookies).
+- `estado`: qué ve en la web (ids, horas y banderas, sin nombres). Escribe `fichaje.json` (cookies).
 - `test-bot`: manda una pregunta de prueba cuyos botones no hacen nada real.
 - `poll`: **solo lectura**, lista los botones pendientes sin procesarlos (quien los procesa es el monitor).
+  Con el monitor en marcha puede responder `error: HTTPError HTTP 409` (Telegram no deja dos
+  oyentes del mismo bot a la vez): es inocuo, el monitor espera 30 s y sigue.
 - `fichar`: **ficha ya, sin pregunta**. Es un «Sí» explícito tuyo; úsalo solo si de verdad
   quieres fichar. Escribe `fichaje.json`.
+
+Si un comando falla, imprime solo el tipo de error (`error: ConnectionError`, `error:
+HTTPError HTTP 400`…), nunca el detalle, que podría llevar la URL con el token o la sesión.
 
 ---
 
