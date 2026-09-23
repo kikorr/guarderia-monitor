@@ -1,5 +1,9 @@
-data/
+# Datos privados y estado: NUNCA al repositorio
 .env
+data/
+secrets/*
+!secrets/README.md
+# Restos locales
 __pycache__/
 *.pyc
 *.bak*

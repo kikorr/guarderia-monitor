@@ -22,11 +22,12 @@ load_dotenv()
 def env_or_file(name, default=""):
     """Lee un secreto de {NAME}_FILE (Docker secret en /run/secrets) si existe;
     si no, cae a la variable de entorno NAME. Permite sacar credenciales de
-    Config.Env (no aparecen en docker inspect). Ver project_env_to_secrets."""
+    Config.Env (no aparecen en docker inspect). utf-8-sig: tolera el BOM de
+    PowerShell."""
     path = os.getenv(name + "_FILE")
     if path:
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8-sig") as fh:
                 return fh.read().strip()
         except OSError:
             pass
@@ -48,7 +49,9 @@ def enmascara(texto):
     texto = str(texto)
     for rx, sust in _MASCARAS:
         texto = rx.sub(sust, texto)
-    for secreto in (os.getenv("WL_PASS"), os.getenv("TG_BOT_TOKEN")):
+    # valores ya cargados (desde *_FILE o del entorno); se buscan en tiempo de ejecucion
+    for secreto in (globals().get("WL_PASS"), globals().get("TG_BOT_TOKEN"),
+                    os.getenv("WL_PASS"), os.getenv("TG_BOT_TOKEN")):
         if secreto and len(secreto) >= 6:
             texto = texto.replace(secreto, "<oculto>")
     return texto

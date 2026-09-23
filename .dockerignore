@@ -4,6 +4,8 @@ __pycache__
 *.pyc
 *.bak*
 data/
+secrets/
+tests/
 README.md
 LICENSE
 .env*

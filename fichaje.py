@@ -2,7 +2,7 @@
 
 Por que existe (23-sep-2026): la agenda del dia solo se desbloquea cuando un padre ficha
 desde la web de fichajes al dejar al nino. Si se olvida, el monitor no recibe nada en
-todo el dia. Decision de kiko: a la hora FICHAJE_HORA de un dia lectivo, si no hay
+todo el dia. Decision de diseno: a la hora FICHAJE_HORA de un dia lectivo, si no hay
 entrada registrada, se pregunta por Telegram con botones Si/No y, solo si dice Si, el
 monitor ficha la entrada. Nunca ficha sin pregunta: un dia de enfermedad o vacaciones
 NO debe registrar una entrada.
@@ -30,7 +30,7 @@ Reglas de seguridad (revision 23-sep-2026):
     y la del bot lleva el token. Se usa _err(e).
   - fichaje.json guarda cookies de sesion: se escribe con permisos 0600.
 
-Secretos (Docker secrets, nunca en el repo): la URL del QR con la sesion de kiko dentro,
+Secretos (Docker secrets, nunca en el repo): la URL del QR con la sesion del padre/madre dentro,
 el DNI y, opcionalmente, un token de bot aparte (por defecto se usa el bot del monitor,
 TG_BOT_TOKEN). Ese bot no puede ser uno que otro proceso ya escuche (el de HA): Telegram solo
 admite un oyente (getUpdates) por bot.
@@ -59,12 +59,17 @@ def _env_or_file(name, default=""):
     """Misma prioridad que env_or_file() de monitor.py: si existe {NAME}_FILE (Docker secret)
     manda el fichero, aunque este vacio (vacio = fichaje desactivado a proposito); si no, la
     variable NAME. Un fichero ilegible NO puede lanzar aqui (esto corre al importar, y
-    tumbaria el monitor entero): se registra y se devuelve el default -> ENABLED=False."""
+    tumbaria el monitor entero): se registra y se devuelve el default -> ENABLED=False.
+    Un fichero que NO existe cuenta como "no configurado" (p. ej. no se ha creado
+    secrets/fichaje_url porque no se quiere el fichaje): se cae a la variable, sin error.
+    utf-8-sig: tolera el BOM que mete PowerShell al crear el fichero."""
     p = os.getenv(name + "_FILE")
     if p:
         try:
-            with open(p, "r", encoding="utf-8") as fh:
+            with open(p, "r", encoding="utf-8-sig") as fh:
                 return fh.read().strip()
+        except FileNotFoundError:
+            return (os.getenv(name) or default).strip()
         except (OSError, UnicodeError, ValueError) as e:
             log.error(f"fichaje: no puedo leer {name}_FILE ({type(e).__name__}); fichaje desactivado")
             return default
@@ -136,7 +141,7 @@ if not STATE_FILE.is_absolute():                             # relativo -> dentr
     STATE_FILE = Path("/data") / STATE_FILE
 DEBUG = os.getenv("FICHAJE_DEBUG", "").strip() == "1"
 DEBUG_HTML = STATE_FILE.parent / "fichaje_ultimo.html"
-UA = "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Mobile Safari/537.36"
+UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"  # UA reducido generico de Chrome movil
 
 ENABLED = bool(URL_QR and DNI and BOT_TOKEN and CHAT_ID)
 # Escucha de botones en un hilo propio (ronda 5). FICHAJE_HILO=0 la desactiva y tick() vuelve a
@@ -1047,7 +1052,7 @@ def _cli(cmd):
                           "error": info.get("error"), "error_tipo": info.get("error_tipo")},
                          ensure_ascii=False, indent=2))
     elif cmd == "fichar":
-        # manual y explicito (lo teclea kiko): equivale a un Si, SIN pregunta
+        # manual y explicito (lo teclea el usuario): equivale a un Si, SIN pregunta
         hecho, info = estado(st)
         print("ya hecho" if hecho else fichar(st, info))
     elif cmd == "test-bot":

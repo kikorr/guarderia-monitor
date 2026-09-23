@@ -1,12 +1,21 @@
 services:
   guarderia-monitor:
     build: .
-    # Alternativa sin compilar (imagen ya construida por CI):
+    # Alternativa sin compilar (imagen ya construida en GitHub):
     # image: ghcr.io/kikorr/guarderia-monitor:latest
     container_name: guarderia-monitor
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Los datos privados van en ficheros dentro de ./secrets (ver README, paso 5).
+      # Si un fichero no existe, se usa la variable del mismo nombre sin _FILE (si la hay).
+      WL_USER_FILE: /run/secrets/wl_user
+      WL_PASS_FILE: /run/secrets/wl_pass
+      TG_BOT_TOKEN_FILE: /run/secrets/tg_bot_token
+      FICHAJE_URL_FILE: /run/secrets/fichaje_url     # solo para el fichaje
+      FICHAJE_DNI_FILE: /run/secrets/fichaje_dni     # solo para el fichaje
     volumes:
-      - ./data:/data          # estado + caché de medios (no se comparte con nadie)
+      - ./data:/data                    # estado, log y caché de fotos (no se comparte con nadie)
+      - ./secrets:/run/secrets:ro       # tus datos privados, solo lectura
     # Para probar la cadena completa sin entrar en el bucle:
     #   docker compose run --rm -e SELF_TEST=1 guarderia-monitor
