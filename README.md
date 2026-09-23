@@ -27,7 +27,7 @@ entera él solo y te avisa del cambio.
   - el login falla o algo se rompe.
 
 Comprueba el muro cada ~1h y la agenda cada ~30min, solo en horario lectivo
-(L-V 07:00–17:00, ignora festivos nacionales), con intervalos aleatorios para no
+(L-V de `WORK_HOUR_START` a `WORK_HOUR_END`, por defecto 07:00–17:00; ignora festivos nacionales), con intervalos aleatorios para no
 martillear el portal. Además hace **una pasada extra cada noche (~22:00)** para pillar
 publicaciones de tardes y fines de semana.
 
@@ -241,6 +241,73 @@ Docker secrets y no quieres que las credenciales aparezcan en `docker inspect`.
 - `TG_CHAT_ID_2` + `TG_THREAD_AGENDA_2` → enviar la agenda además a un segundo grupo.
 - `WL_LOGIN_URL` → punto de entrada del portal (por defecto `https://comunidaddefamilias.com`).
 - `TZ=Europe/Madrid` → zona horaria.
+- `WORK_HOUR_START=7` / `WORK_HOUR_END=17` → horario lectivo en que se revisan muro y
+  agenda (horas enteras, 24 h; se mira de `START:00` hasta antes de `END:00`). Un valor
+  no entero o `START >= END` se ignora (con error en el log) y se usa 7–17.
+  Ojo: `AGENDA_EMPTY_ALERT_HOUR` no se ajusta a este horario; si `WORK_HOUR_END` es
+  menor o igual que esa hora (15 por defecto), el aviso de agenda vacía no llega a salir.
+
+### Fichaje de entrada (opcional)
+La agenda del día solo se desbloquea cuando un padre ficha la entrada en la web de
+fichajes (el QR de la puerta). Si se os olvida, este módulo lo detecta y **pregunta por
+Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
+
+- A `FICHAJE_HORA` de un día lectivo mira la web. Si ya hay entrada, no hace nada. Si
+  falta, pregunta; si nadie contesta, repite una vez a los `FICHAJE_RECORDATORIO_MIN`.
+- **Nunca ficha sin un «Sí» explícito y vigente**: el botón tiene que ser de la pregunta
+  de hoy, sin respuesta previa y dentro de las 3 h siguientes a `FICHAJE_HORA`. Un botón
+  viejo contesta «Pregunta caducada». Un día de enfermedad o vacaciones basta con pulsar No
+  (o no contestar).
+- Ficha solo los alumnos que la web trae **marcados y no ausentes**. Si la ficha no
+  muestra botones de entrada ni salida, o sigue pidiendo el DNI, no ficha y avisa
+  (al tema/chat de Sistema si lo tienes).
+- **Usa un bot propio**, distinto de `TG_BOT_TOKEN`: Telegram solo deja a un programa
+  escuchar los botones de un bot (`getUpdates`), y si el bot ya lo usa otro sistema (p. ej.
+  Home Assistant) se pisarían. Crea otro bot con @BotFather y añádelo al grupo.
+  Si usas `SISTEMA_CHAT_ID` o `TG_THREAD_SISTEMA`, el bot del fichaje tiene que estar
+  **también en ese grupo/tema** para dejar ahí sus avisos; si no está, el aviso cae al
+  chat del fichaje (`FICHAJE_CHAT_ID`).
+
+| Variable | Para qué |
+|---|---|
+| `FICHAJE_URL` / `FICHAJE_URL_FILE` | Enlace del QR de fichajes (lleva tu sesión: trátalo como una contraseña). |
+| `FICHAJE_DNI` / `FICHAJE_DNI_FILE` | DNI del padre/madre con el que se ficha. |
+| `FICHAJE_BOT_TOKEN` / `FICHAJE_BOT_TOKEN_FILE` | Token del bot propio del fichaje. |
+| `FICHAJE_CHAT_ID` | Chat donde pregunta (vacío = `TG_CHAT_ID`). |
+| `FICHAJE_THREAD` | Tema donde pregunta (vacío = `TG_THREAD_AGENDA`). |
+| `FICHAJE_HORA` | Hora de la pregunta, `HH:MM` (por defecto `09:00`; si está mal escrita, usa `09:00`). |
+| `FICHAJE_RECORDATORIO_MIN` | Minutos hasta el recordatorio (por defecto 30; `0` = sin recordatorio). |
+| `FICHAJE_DIAS_CERRADO` | Días sin cole además de fines de semana y festivos nacionales: `AAAA-MM-DD,AAAA-MM-DD` (festivos de Madrid, cierres del centro). |
+| `FICHAJE_COOKIES_EXTRA` | Cookies que añadir a la sesión, `nombre=valor;nombre2=valor2` (ver abajo). |
+| `FICHAJE_CENTRO` | Id del centro en la web de fichajes. Vacío = se lee de la página del QR (rellénalo solo si esa lectura falla). |
+| `FICHAJE_STATE` | Fichero de estado (por defecto `/data/fichaje.json`). |
+| `FICHAJE_DEBUG` | `1` guarda el último HTML de la ficha en `/data/fichaje_ultimo.html` (permisos 0600; se borra tras un fichaje correcto). |
+
+Si falta la URL, el DNI, el token o el chat, el módulo queda **desactivado** (el log lo dice al arrancar).
+El estado (`/data/fichaje.json`) guarda las cookies de la web y se escribe con permisos 0600.
+
+**Consentimiento de cookies.** La web pide aceptar las cookies «para este navegador y
+dispositivo». Si al fichar el aviso dice que *la web sigue pidiendo el DNI*, abre el
+enlace del QR en el navegador, pulsa **Aceptar todas**, mira en las herramientas de
+desarrollo (Aplicación → Cookies) qué cookie se ha creado y ponla en `FICHAJE_COOKIES_EXTRA`.
+
+Si la web falla o sigue pidiendo el DNI, lo reintenta hasta 3 veces con 10 min de pausa
+y solo al tercer fallo avisa y deja el día. Si tras un «Sí» no consigue fichar (o el
+contenedor se reinicia a mitad), lo reintenta con su propio tope de 3 intentos, aunque ya
+hayan pasado las 3 h de la pregunta; si cambia el día sin conseguirlo, lo dice y lo deja.
+Si no puede guardar su estado en `/data`, **no ficha** (contesta al botón que lo
+reintentará) hasta que pueda escribir. La pregunta con botones sale como mucho 2 veces
+al día. Los avisos que no llegan por Telegram se reintentan hasta 3 veces.
+
+Las variables `_FILE` mandan sobre la variable normal (igual que en el resto del monitor);
+un fichero vacío o ilegible deja el fichaje desactivado sin tumbar el monitor.
+
+Comandos manuales dentro del contenedor (`docker exec guarderia-monitor python fichaje.py …`):
+- `estado`: qué ve en la web. Escribe `fichaje.json` (cookies).
+- `test-bot`: manda una pregunta de prueba cuyos botones no hacen nada real.
+- `poll`: **solo lectura**, lista los botones pendientes sin procesarlos (quien los procesa es el monitor).
+- `fichar`: **ficha ya, sin pregunta**. Es un «Sí» explícito tuyo; úsalo solo si de verdad
+  quieres fichar. Escribe `fichaje.json`.
 
 ---
 

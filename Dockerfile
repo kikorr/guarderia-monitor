@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY monitor.py .
+COPY monitor.py fichaje.py .
 
 CMD ["python", "-u", "monitor.py"]

@@ -446,13 +446,31 @@ def is_spanish_holiday(dt):
     return False
 
 
+# 23-sep-2026: horario de monitorizacion parametrizable (antes 07:00-17:00 fijo).
+# Un valor no entero o START >= END no tumba el arranque: log.error y 7/17 (como FICHAJE_HORA).
+def _work_hours():
+    try:
+        ini = int(os.getenv("WORK_HOUR_START", "").strip() or 7)
+        fin = int(os.getenv("WORK_HOUR_END", "").strip() or 17)
+    except ValueError:
+        log.error("WORK_HOUR_START/WORK_HOUR_END no son horas enteras (p. ej. 7 y 17); uso 7-17")
+        return 7, 17
+    if not (0 <= ini < fin <= 24):
+        log.error(f"WORK_HOUR_START={ini} / WORK_HOUR_END={fin} no forman un horario valido; uso 7-17")
+        return 7, 17
+    return ini, fin
+
+
+WORK_HOUR_START, WORK_HOUR_END = _work_hours()
+
+
 def is_working_time():
     now = datetime.now()
     if now.weekday() >= 5:
         return False
     if is_spanish_holiday(now):
         return False
-    return 7 <= now.hour < 17
+    return WORK_HOUR_START <= now.hour < WORK_HOUR_END
 
 
 def random_wait(interval):
@@ -1199,6 +1217,9 @@ def run_self_test():
 
 
 # --- Main loop ---
+import fichaje  # 23-sep-2026: fichaje de entrada con bot propio (ver fichaje.py)
+
+
 def main():
     log.info("=== Guarderia Monitor starting ===")
     if os.getenv("SELF_TEST") == "1":
@@ -1228,9 +1249,10 @@ def main():
     next_evening = next_evening_sweep() if EVENING_MURO_HOUR else None
     next_prune = datetime.now() + timedelta(minutes=5)
 
+    log.info(f"Fichaje guarderia: {'ACTIVO a las ' + fichaje.HORA if fichaje.ENABLED else 'desactivado (faltan secretos)'}")
     log.info(
         f"Scheduler: muro ~{MURO_INTERVAL[0]}-{MURO_INTERVAL[1]}min, "
-        f"agenda ~{AGENDA_INTERVAL[0]}-{AGENDA_INTERVAL[1]}min, 07:00-17:00"
+        f"agenda ~{AGENDA_INTERVAL[0]}-{AGENDA_INTERVAL[1]}min, {WORK_HOUR_START:02d}:00-{WORK_HOUR_END:02d}:00"
     )
 
     while True:
@@ -1256,11 +1278,11 @@ def main():
                     next_agenda = now + wait
                     log.info(f"Next agenda in {int(wait.total_seconds() / 60)}min")
             else:
-                if now.hour >= 17 and next_muro < now:
-                    tomorrow_7 = (now + timedelta(days=1)).replace(hour=7, minute=0, second=0)
+                if now.hour >= WORK_HOUR_END and next_muro < now:
+                    tomorrow_7 = (now + timedelta(days=1)).replace(hour=WORK_HOUR_START, minute=0, second=0)
                     next_muro = tomorrow_7 + random_wait((1, 10))
                     next_agenda = tomorrow_7 + random_wait((1, 5))
-                    log.info("Outside hours. Next checks at ~07:0x tomorrow")
+                    log.info(f"Outside hours. Next checks at ~{WORK_HOUR_START:02d}:0x tomorrow")
 
             # Pasada nocturna del muro (cualquier día) para tardes/fines de semana
             if next_evening and now >= next_evening:
@@ -1270,6 +1292,11 @@ def main():
                 next_evening = next_evening_sweep()
                 log.info(f"Próxima pasada nocturna: {next_evening:%Y-%m-%d %H:%M}")
 
+            # Fichaje de la guarderia (23-sep-2026): a FICHAJE_HORA en dia lectivo
+            # pregunta por Telegram (bot propio) y ficha solo si se responde que si.
+            # Va fuera de is_working_time() a proposito: escucha los botones siempre.
+            fichaje.tick(now, lambda: now.weekday() < 5 and not is_spanish_holiday(now))
+
             # Limpieza diaria de la caché de media
             if now >= next_prune:
                 prune_media()
@@ -1277,7 +1304,7 @@ def main():
 
         except Exception as e:
             log.exception("Error no controlado en el bucle principal")
-            alert_once("main-loop", f"⚠️ Monitor guardería: error no controlado ({e}). Sigo en marcha.")
+            alert_once("main-loop", f"⚠️ Monitor guardería: error no controlado ({fichaje._err(e)}). Sigo en marcha.")  # _err: nunca str(e), puede llevar URLs con sesion
             # No reintentar inmediatamente en bucle si el fallo es persistente
             floor = datetime.now() + timedelta(minutes=5)
             next_muro = max(next_muro, floor)
