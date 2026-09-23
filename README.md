@@ -280,10 +280,13 @@ Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
 - Si la ficha no lista niños, no tiene el botón de registro o hay niños sin entrada que
   no se pueden marcar, avisa (al tema/chat de Sistema si lo tienes) y deja el día. Si
   sigue pidiendo el DNI, lo trata como un fallo pasajero (ver más abajo).
-- **Usa un bot propio**, distinto de `TG_BOT_TOKEN`: Telegram solo deja a un programa
-  escuchar los botones de un bot (`getUpdates`), y si el bot ya lo usa otro sistema (p. ej.
-  Home Assistant) se pisarían. Crea otro bot con @BotFather y añádelo al grupo.
-  Si usas `SISTEMA_CHAT_ID` o `TG_THREAD_SISTEMA`, el bot del fichaje tiene que estar
+- **Un solo bot para todo**: por defecto el fichaje usa el mismo bot que el monitor
+  (`TG_BOT_TOKEN`), así que muro, agenda, avisos y fichaje salen del mismo sitio.
+  `FICHAJE_BOT_TOKEN` es opcional, solo si quieres un bot aparte para el fichaje.
+  Ojo: el bot del monitor **no puede ser uno que otro programa ya escuche** (p. ej. el de
+  Home Assistant): Telegram solo deja a un programa escuchar los botones de un bot
+  (`getUpdates`) y se pisarían. Por eso el monitor lleva su bot propio.
+  Si usas `SISTEMA_CHAT_ID` o `TG_THREAD_SISTEMA`, el bot tiene que estar
   **también en ese grupo/tema** para dejar ahí sus avisos; si no está, el aviso cae al
   chat del fichaje (`FICHAJE_CHAT_ID`).
 
@@ -291,7 +294,7 @@ Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
 |---|---|
 | `FICHAJE_URL` / `FICHAJE_URL_FILE` | Enlace del QR de fichajes (lleva tu sesión: trátalo como una contraseña). |
 | `FICHAJE_DNI` / `FICHAJE_DNI_FILE` | DNI del padre/madre con el que se ficha. |
-| `FICHAJE_BOT_TOKEN` / `FICHAJE_BOT_TOKEN_FILE` | Token del bot propio del fichaje. |
+| `FICHAJE_BOT_TOKEN` / `FICHAJE_BOT_TOKEN_FILE` | Opcional: bot aparte para el fichaje. Si no se pone, se usa `TG_BOT_TOKEN`. |
 | `FICHAJE_CHAT_ID` | Chat donde pregunta (vacío = `TG_CHAT_ID`). |
 | `FICHAJE_THREAD` | Tema donde pregunta (vacío = `TG_THREAD_AGENDA`). |
 | `FICHAJE_HORA` | Hora de la pregunta, `HH:MM` (por defecto `09:00`; si está mal escrita, usa `09:00`). |
@@ -303,7 +306,7 @@ Telegram** con dos botones: **Sí, ficha** / **No, hoy no**.
 | `FICHAJE_HILO` | `0` desactiva el hilo de escucha y los botones se leen cada 30 s desde el bucle (modo antiguo, para pruebas). Por defecto activo. |
 | `FICHAJE_DEBUG` | `1` guarda el último HTML de la ficha en `/data/fichaje_ultimo.html` (permisos 0600; se borra tras un fichaje comprobado). Contiene nombres: no lo compartas. |
 
-Si falta la URL, el DNI, el token o el chat, el módulo queda **desactivado** (el log lo dice al arrancar).
+Si falta la URL, el DNI, el token (ni `FICHAJE_BOT_TOKEN` ni `TG_BOT_TOKEN`) o el chat, el módulo queda **desactivado** (el log lo dice al arrancar).
 El estado (`/data/fichaje.json`) guarda las cookies de la web y se escribe con permisos 0600.
 
 **Consentimiento de cookies.** La web pide aceptar las cookies «para este navegador y

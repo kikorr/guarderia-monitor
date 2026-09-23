@@ -33,6 +33,39 @@ def env_or_file(name, default=""):
     return os.getenv(name, default)
 
 
+# 23-sep-2026: nunca str(e) crudo en logs ni en Telegram. Un HTTPError de requests lleva la URL
+# completa: https://api.telegram.org/bot<TOKEN>/... (el token acababa en monitor.log y docker logs),
+# y las URLs del portal llevan la sesion (?p=..., p5rkv8nc58hag=...).
+_MASCARAS = (
+    (re.compile(r"bot\d+:[\w-]+"), "bot<oculto>"),
+    (re.compile(r"\?p=[^\s&'\"]+"), "?p=<oculto>"),
+    (re.compile(r"p5rkv8nc58hag=[^\s&'\"]+"), "<sesion>"),
+)
+
+
+def enmascara(texto):
+    """Quita token de bot y parametros de sesion de cualquier texto que vaya a log o a Telegram."""
+    texto = str(texto)
+    for rx, sust in _MASCARAS:
+        texto = rx.sub(sust, texto)
+    for secreto in (os.getenv("WL_PASS"), os.getenv("TG_BOT_TOKEN")):
+        if secreto and len(secreto) >= 6:
+            texto = texto.replace(secreto, "<oculto>")
+    return texto
+
+
+def err_txt(e):
+    """Tipo de excepcion + 'HTTP nnn' si hay respuesta + su mensaje ENMASCARADO (max 200)."""
+    partes = [type(e).__name__]
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) is not None:
+        partes.append(f"HTTP {resp.status_code}")
+    msg = enmascara(e)[:200]
+    if msg:
+        partes.append(f"- {msg}")
+    return " ".join(partes)
+
+
 # --- Config ---
 # NO hay URL de aula en la configuración: el centro, las aulas y la agenda se
 # descubren tras el login (ver discover_aulas). Con MURO_URL fijo, el sid del
@@ -139,7 +172,7 @@ def load_state():
                 state = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
             # state.json corrupto: apartarlo y re-baselinear (sin notificaciones)
-            log.error(f"state.json corrupto ({e}) — se aparta y se re-baselinea")
+            log.error(f"state.json corrupto ({err_txt(e)}) — se aparta y se re-baselinea")
             try:
                 STATE_FILE.replace(STATE_FILE.with_suffix(".corrupt"))
             except OSError:
@@ -163,8 +196,8 @@ def save_state(state):
         tmp.replace(STATE_FILE)
     except OSError as e:
         # Sin esto, un disco lleno mataba el proceso en bucle (save fuera de try en el caller)
-        log.error(f"save_state FALLÓ: {e}")
-        alert_once("save-state", f"⚠️ No puedo guardar el estado del monitor ({e}). ¿Disco lleno?")
+        log.error(f"save_state FALLÓ: {err_txt(e)}")
+        alert_once("save-state", f"⚠️ No puedo guardar el estado del monitor ({err_txt(e)}). ¿Disco lleno?")
 
 
 # --- Alertas con cooldown (evita spamear Telegram con el mismo problema cada ciclo) ---
@@ -242,10 +275,10 @@ def tg_send_message(text, thread_id, chat_id=None, max_retries=4):
         except Exception as e:
             if attempt < max_retries:
                 wait = 2 * attempt
-                log.warning(f"TG send error chat={target_chat}: {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                log.warning(f"TG send error chat={target_chat}: {err_txt(e)}; reintento en {wait}s ({attempt}/{max_retries})")
                 time.sleep(wait)
                 continue
-            log.error(f"TG send error definitivo chat={target_chat} thread={thread_id}: {e}")
+            log.error(f"TG send error definitivo chat={target_chat} thread={thread_id}: {err_txt(e)}")
     return None
 
 
@@ -260,7 +293,7 @@ def tg_delete_message(message_id, chat_id=None):
         )
         log.info(f"TG deleted message_id={message_id} chat={target_chat} (ok={r.json().get('ok')})")
     except Exception as e:
-        log.warning(f"TG delete error chat={target_chat} mid={message_id}: {e}")
+        log.warning(f"TG delete error chat={target_chat} mid={message_id}: {err_txt(e)}")
 
 
 def tg_send_file(method, field, file_path, caption, thread_id, chat_id=None, max_retries=4):
@@ -289,10 +322,10 @@ def tg_send_file(method, field, file_path, caption, thread_id, chat_id=None, max
         except Exception as e:
             if attempt < max_retries:
                 wait = 2 * attempt
-                log.warning(f"TG {method} error ({name}): {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                log.warning(f"TG {method} error ({name}): {err_txt(e)}; reintento en {wait}s ({attempt}/{max_retries})")
                 time.sleep(wait)
                 continue
-            log.error(f"TG {method} error definitivo ({file_path}): {e}")
+            log.error(f"TG {method} error definitivo ({file_path}): {err_txt(e)}")
             return False
     log.error(f"TG {method} agotados reintentos ({file_path})")
     return False
@@ -334,10 +367,10 @@ def tg_send_media_group(items, thread_id, chat_id=None, max_retries=4):
         except Exception as e:
             if attempt < max_retries:
                 wait = 3 * attempt
-                log.warning(f"TG álbum error ({names}): {e}; reintento en {wait}s ({attempt}/{max_retries})")
+                log.warning(f"TG álbum error ({names}): {err_txt(e)}; reintento en {wait}s ({attempt}/{max_retries})")
                 time.sleep(wait)
                 continue
-            log.error(f"TG álbum error definitivo ({names}): {e}")
+            log.error(f"TG álbum error definitivo ({names}): {err_txt(e)}")
     return False
 
 
@@ -539,15 +572,15 @@ def extract_agenda_url(soup):
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
         if "agenda2.workandlife.com" in href:
-            log.info(f"Agenda URL found: {href}")
+            log.info(f"Agenda URL found: {enmascara(href)}")
             return href
         link_text = a_tag.get_text(strip=True).lower()
         if "agenda" in link_text and "workandlife" in href:
-            log.info(f"Agenda URL found (by text): {href}")
+            log.info(f"Agenda URL found (by text): {enmascara(href)}")
             return href
     for iframe in soup.find_all("iframe", src=True):
         if "agenda2.workandlife.com" in iframe["src"]:
-            log.info(f"Agenda URL found (iframe): {iframe['src']}")
+            log.info(f"Agenda URL found (iframe): {enmascara(iframe['src'])}")
             return iframe["src"]
     return None
 
@@ -604,7 +637,7 @@ def do_login():
         _session = s
         return s
     except Exception as e:
-        log.error(f"Login error: {e}")
+        log.error(f"Login error: {err_txt(e)}")
         return None
 
 
@@ -632,7 +665,7 @@ def get_authed(url, timeout=30):
             resp = session.get(url, timeout=timeout)
             resp.raise_for_status()
         except Exception as e:
-            log.error(f"GET {url} falló: {e}")
+            log.error(f"GET {url} falló: {err_txt(e)}")
             return None
         if _looks_logged_in(resp):
             return resp
@@ -683,7 +716,7 @@ def discover_aulas():
             filtro = re.compile(AULAS_INCLUDE, re.IGNORECASE)
             aulas = [a for a in aulas if filtro.search(a["name"])]
         except re.error as e:
-            log.error(f"AULAS_INCLUDE no es una regex válida ({e}) — se ignora el filtro")
+            log.error(f"AULAS_INCLUDE no es una regex válida ({err_txt(e)}) — se ignora el filtro")
 
     log.info(f"Aulas descubiertas: {[a['name'] for a in aulas]}")
     return aulas, soup
@@ -819,7 +852,7 @@ def check_muro(state, first_run=False):
         aulas, portal_soup = discover_aulas()
     except Exception as e:
         _muro_fail_count += 1
-        log.error(f"Muro fetch error ({_muro_fail_count} seguidos): {e}")
+        log.error(f"Muro fetch error ({_muro_fail_count} seguidos): {err_txt(e)}")
         # Solo alertar a partir del 2º fallo consecutivo (los hipos puntuales se auto-resuelven)
         if _muro_fail_count >= 2:
             alert_once("muro-fetch", "⚠️ Error listando las aulas del portal (2+ intentos).", cooldown_min=360)
@@ -884,13 +917,13 @@ def check_muro(state, first_run=False):
                 n = fails.get(pub_id, 0) + 1
                 fails[pub_id] = n
                 if n >= PUB_MAX_ATTEMPTS:
-                    log.error(f"pub={pub_id}: {n} intentos fallidos, se descarta: {e}")
+                    log.error(f"pub={pub_id}: {n} intentos fallidos, se descarta: {err_txt(e)}")
                     alert_once(f"pub-{pub_id}",
                                f"⚠️ No pude descargar una publicación del muro tras {n} intentos (pub={pub_id}).")
                     state.setdefault("pub_ids", []).append(pub_id)
                     fails.pop(pub_id, None)
                 else:
-                    log.warning(f"pub={pub_id}: fallo de descarga (intento {n}/{PUB_MAX_ATTEMPTS}), se reintentará: {e}")
+                    log.warning(f"pub={pub_id}: fallo de descarga (intento {n}/{PUB_MAX_ATTEMPTS}), se reintentará: {err_txt(e)}")
                 continue
 
             # Fase 2: entregar. A partir de aquí marcamos vista SIEMPRE (reintentar
@@ -1077,7 +1110,7 @@ def check_agenda(state, first_run=False):
         resp.raise_for_status()
         page_html = resp.content.decode("iso-8859-1")
     except Exception as e:
-        log.error(f"Agenda fetch error: {e}")
+        log.error(f"Agenda fetch error: {err_txt(e)}")
         return
 
     current = parse_agenda(page_html)
@@ -1151,7 +1184,7 @@ def run_self_test():
     try:
         aulas, portal_soup = discover_aulas()
     except Exception as e:
-        tg_send_message(f"❌ <b>[TEST]</b> Login OK pero no pude listar las aulas: {html.escape(str(e))}",
+        tg_send_message(f"❌ <b>[TEST]</b> Login OK pero no pude listar las aulas: {html.escape(err_txt(e))}",
                         TG_THREAD_SISTEMA, chat_id=SISTEMA_CHAT_ID)
         return
     nombres = ", ".join(html.escape(a["name"]) for a in aulas) or "(ninguna)"
@@ -1199,7 +1232,7 @@ def run_self_test():
     try:
         media_list, _ = _extract_pub_media(session, pub_id)
     except Exception as e:
-        log.error(f"self-test ZIP error: {e}")
+        log.error(f"self-test ZIP error: {err_txt(e)}")
         media_list = None
     n_media = failed = 0
     if media_list:
@@ -1303,7 +1336,11 @@ def main():
                 next_prune = now + timedelta(days=1)
 
         except Exception as e:
-            log.exception("Error no controlado en el bucle principal")
+            # sin traceback por defecto: el mensaje de la excepcion (que sale en el traceback) puede
+            # llevar la URL de Telegram con el token; con DEBUG=1 o FICHAJE_DEBUG=1 se muestra entero
+            log.error(f"Error no controlado en el bucle principal: {err_txt(e)}")
+            if "1" in (os.getenv("DEBUG", ""), os.getenv("FICHAJE_DEBUG", "")):
+                log.exception("traceback (DEBUG)")
             alert_once("main-loop", f"⚠️ Monitor guardería: error no controlado ({fichaje._err(e)}). Sigo en marcha.")  # _err: nunca str(e), puede llevar URLs con sesion
             # No reintentar inmediatamente en bucle si el fallo es persistente
             floor = datetime.now() + timedelta(minutes=5)

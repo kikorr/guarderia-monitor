@@ -31,8 +31,9 @@ Reglas de seguridad (revision 23-sep-2026):
   - fichaje.json guarda cookies de sesion: se escribe con permisos 0600.
 
 Secretos (Docker secrets, nunca en el repo): la URL del QR con la sesion de kiko dentro,
-el DNI y el token del bot propio. El bot es distinto del de HA porque Telegram solo admite
-un oyente (getUpdates) por bot y el de HA ya lo ocupa.
+el DNI y, opcionalmente, un token de bot aparte (por defecto se usa el bot del monitor,
+TG_BOT_TOKEN). Ese bot no puede ser uno que otro proceso ya escuche (el de HA): Telegram solo
+admite un oyente (getUpdates) por bot.
 
 Estado en /data/fichaje.json: cookies de la web, offset de Telegram, fechas de
 pregunta/respuesta/fichaje. Todo lo importante se registra en el log del monitor.
@@ -90,7 +91,11 @@ def _hora_valida(s):
 
 URL_QR = _env_or_file("FICHAJE_URL")          # https://agenda2.workandlife.com/fichajes_padres/?p=...
 DNI = _env_or_file("FICHAJE_DNI").upper().replace(" ", "").replace("-", "")
-BOT_TOKEN = _env_or_file("FICHAJE_BOT_TOKEN")
+# Un solo bot para todo (ronda 6): por defecto el del monitor (TG_BOT_TOKEN/_FILE); FICHAJE_BOT_TOKEN
+# es un override opcional para quien quiera un bot aparte. El bot NO puede ser uno que otro proceso
+# ya escuche con getUpdates (p. ej. el de Home Assistant): Telegram solo admite un oyente por bot.
+_TG_TOKEN_MONITOR = _env_or_file("TG_BOT_TOKEN")
+BOT_TOKEN = _env_or_file("FICHAJE_BOT_TOKEN") or _TG_TOKEN_MONITOR
 CHAT_ID = os.getenv("FICHAJE_CHAT_ID", "").strip() or os.getenv("TG_CHAT_ID", "").strip()
 THREAD_ID = _env_id("FICHAJE_THREAD") or _env_id("TG_THREAD_AGENDA")   # invalido -> cae al de la agenda
 # Avisos tecnicos (web caida, ficha rara): al hilo/chat de Sistema del monitor si existe.
@@ -147,8 +152,9 @@ class FichajeError(RuntimeError):
 def _limpia(s):
     s = re.sub(r"\?p=[^\s'\"&]+", "?p=<oculto>", s)
     s = re.sub(r"bot\d+:[\w-]+", "bot<oculto>", s)
-    if BOT_TOKEN:
-        s = s.replace(BOT_TOKEN, "<oculto>")
+    for tok in {BOT_TOKEN, _TG_TOKEN_MONITOR}:
+        if tok:
+            s = s.replace(tok, "<oculto>")
     if DNI:
         s = s.replace(DNI, "<DNI>")
     if URL_QR:
