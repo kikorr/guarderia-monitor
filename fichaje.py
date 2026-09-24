@@ -113,6 +113,14 @@ if _hora_valida(HORA) is None:
     HORA = "09:00"
 HH, MM = _hora_valida(HORA)
 VENTANA = timedelta(hours=3)                                 # validez de la pregunta
+# Salida (24-sep-2026): SOLO recordatorio con pregunta Si/No, nunca automatica.
+# FICHAJE_HORA_SALIDA sin definir -> 16:45; definida vacia -> desactivada; mal escrita -> log.error y 16:45.
+_hs = os.getenv("FICHAJE_HORA_SALIDA")
+HORA_SALIDA = "16:45" if _hs is None else _hs.strip()
+if HORA_SALIDA and _hora_valida(HORA_SALIDA) is None:
+    log.error("fichaje: FICHAJE_HORA_SALIDA no es HH:MM valido; uso 16:45")
+    HORA_SALIDA = "16:45"
+HH_S, MM_S = _hora_valida(HORA_SALIDA) if HORA_SALIDA else (None, None)
 try:
     RECORDATORIO_MIN = int(os.getenv("FICHAJE_RECORDATORIO_MIN", "").strip() or 30)
 except ValueError:
@@ -179,11 +187,25 @@ def _err(e):
 
 
 # ── estado ────────────────────────────────────────────────────────────────────
+def _iso(v):
+    """datetime de una cadena ISO, o None si no lo es (estado corrupto o editado a mano)."""
+    try:
+        return datetime.fromisoformat(v) if isinstance(v, str) else None
+    except ValueError:
+        return None
+
+
 def load_state():
     d = {"cookies": {}, "tg_offset": 0, "tg_primed": False,
          "si_pendiente": False, "si_msg_id": None, "si_quien": None, "si_texto_base": None,
          "err_fichar": 0, "err_fichar_until": None, "q_date": None, "q_envios": 0,
          "aviso_pendiente": None, "nota_pregunta": None, "discrepancia_date": None,
+         "salida_checked_date": None, "salida_recheck_at": None, "salida_ultima_lectura": None,
+         "err_recordatorio": 0, "err_recordatorio_until": None, "entrada_constaba_hora": None, "salida_done_date": None, "salida_asked_date": None,
+         "salida_msg_ids": [], "salida_answer": None, "salida_answer_date": None, "salida_reminded_date": None,
+         "salida_q_envios": 0, "salida_entrada_hora": None, "si_salida_pendiente": False,
+         "si_salida_msg_id": None, "si_salida_quien": None, "salida_texto_base": None,
+         "err_salida": 0, "err_salida_until": None, "err_fsalida": 0, "err_fsalida_until": None,
          "asked_date": None, "asked_msg_ids": [], "reminded_date": None,
          "answer": None, "answer_date": None, "done_date": None,
          "err_date": None, "err_count": 0, "err_until": None,
@@ -194,6 +216,11 @@ def load_state():
         pass
     if not isinstance(d.get("asked_msg_ids"), list):
         d["asked_msg_ids"] = []
+    if not isinstance(d.get("salida_msg_ids"), list):
+        d["salida_msg_ids"] = []
+    for k in ("salida_recheck_at", "salida_ultima_lectura"):
+        if d.get(k) is not None and _iso(d.get(k)) is None:
+            d[k] = None
     if not isinstance(d.get("test_msg_ids"), list):
         d["test_msg_ids"] = []
     return d
@@ -398,7 +425,12 @@ def _parse_ficha(html):
                 info["padre"], info["centro_web"], info["tipo_web"] = m.group(1), m.group(2), m.group(3)
                 break
     presentes = [a for a in info["alumnos"] if not a["ausente"]]
+    # pendientes = de ENTRADA (no ausentes, sin hora de entrada, casilla activa)
     info["pendientes"] = [a["id"] for a in presentes if not a["entrada"] and not a["disabled"]]
+    # pendientes de SALIDA: no ausentes, CON entrada y SIN salida (la casilla sigue activa hasta la salida)
+    info["pendientes_salida"] = [a["id"] for a in presentes if a["entrada"] and not a["salida"] and not a["disabled"]]
+    info["con_entrada"] = sum(1 for a in presentes if a["entrada"])
+    info["todos_ausentes"] = bool(info["alumnos"]) and not presentes
     if "DNI" in texto and "introduce" in texto.lower():
         info["error_tipo"] = "dni"
         info["error"] = "la web sigue pidiendo el DNI: ¿DNI incorrecto, sesion del QR caducada o falta aceptar las cookies (FICHAJE_COOKIES_EXTRA)?"
@@ -411,13 +443,12 @@ def _parse_ficha(html):
     else:
         # hecho = todos los ninos no ausentes tienen hora de entrada (todos ausentes: nada que fichar)
         info["hecho"] = all(a["entrada"] for a in presentes)
+        # OJO (medido el 24-sep-2026): data-p3 (tipo_web) vale "1" tanto sin entrada como con la
+        # entrada hecha y con las dos: NO dice si toca entrada o salida; lo decide el servidor por el
+        # estado del dia. Por eso ya no hay error de "tipo": se envia tal cual (ver fichar()).
         if not info["hecho"] and not info["pendientes"]:
-            info["error_tipo"] = "botones"
+            info["error_tipo"] = "bloqueados"
             info["error"] = "hay niños sin entrada pero la ficha no deja marcarlos, mírala tú"
-        elif not info["hecho"] and info["tipo_web"] != "1":
-            info["error_tipo"] = "tipo"
-            info["error"] = (f"la web propone un registro de tipo {info['tipo_web']}, no una entrada; "
-                             "no ficho, mírala tú")
     return info
 
 
@@ -439,24 +470,30 @@ class FichajeNoTransitorio(FichajeError):
     """Error que no se arregla reintentando: se avisa y se deja el dia (como 'sin botones')."""
 
 
-def fichar(st, info):
-    """Ficha la ENTRADA (tipo 1) de los ninos pendientes (sin entrada, no ausentes, casilla activa).
+def fichar(st, info, tipo_registro="entrada"):
+    """Pulsa «Realizar registro» para los ninos pendientes de ENTRADA o de SALIDA.
+
+    Envia lo mismo que el navegador: chk_<id>=<idAlumno> de cada nino, padre, idCentro y
+    tipo=data-p3 TAL CUAL (el servidor decide si es entrada o salida por el estado del dia).
+    tipo_registro ("entrada"|"salida") solo decide a quien se marca y QUE se comprueba despues:
+    tras el POST la ficha debe mostrar la hora de entrada (o de salida) de esos ninos.
     Devuelve (ok, mensaje) o lanza FichajeError (transitorio) / FichajeNoTransitorio."""
-    if info.get("error"):
+    salida = tipo_registro == "salida"
+    if info.get("error") and not (salida and info.get("error_tipo") == "bloqueados"):
         if info.get("error_tipo") == "dni":
             raise FichajeError(info["error"])
         raise FichajeNoTransitorio(info["error"])
     if not info.get("padre"):
         raise FichajeNoTransitorio("no encuentro el id del padre en la ficha")
-    if info.get("tipo_web") != "1":
-        raise FichajeNoTransitorio(f"la web propone un registro de tipo {info.get('tipo_web')}, "
-                                   "no una entrada; no ficho")
-    pendientes = list(info.get("pendientes") or [])
+    tipo = (info.get("tipo_web") or "").strip()
+    if not tipo:
+        raise FichajeNoTransitorio("la ficha no trae el tipo de registro (data-p3 del botón); no ficho")
+    pendientes = list(info.get("pendientes_salida" if salida else "pendientes") or [])
     if not pendientes:
-        raise FichajeNoTransitorio("no hay ningún niño pendiente de entrada que se pueda marcar")
+        raise FichajeNoTransitorio(f"no hay ningún niño pendiente de {tipo_registro} que se pueda marcar")
     campos = {a["id"]: a["campo"] for a in info.get("alumnos") or []}
     data = [(campos.get(a) or f"chk_{a}", a) for a in pendientes]      # como $('.chk_alu:checked')
-    data += [("padre", info["padre"]), ("idCentro", info.get("centro_web") or info["centro"]), ("tipo", "1")]
+    data += [("padre", info["padre"]), ("idCentro", info.get("centro_web") or info["centro"]), ("tipo", tipo)]
     files = [(k, (None, str(v))) for k, v in data]   # multipart, como FormData del navegador
     s = _session(st)
     r = s.post(_base() + "/fichajes_padres/actions/hacer_fichaje.php", files=files, timeout=30)
@@ -465,22 +502,29 @@ def fichar(st, info):
         j = r.json()
     except Exception:
         return False, f"respuesta no JSON (HTTP {r.status_code})"
-    desc = _limpia(str(j.get("Descripcion") or j.get("Resultado") or "sin descripcion"))[:300]
-    if str(j.get("Resultado", "")).upper() != "OK":
-        return False, desc
-    # comprobacion: la ficha debe mostrar ahora la entrada de esos ninos. Si no, NO se reintenta el POST.
+    # Resultado y Descripcion del servidor son texto libre (pueden llevar nombres): nunca a Telegram ni
+    # al log normal; solo con FICHAJE_DEBUG=1 al log.
+    resultado = str(j.get("Resultado", "")).strip()
+    if DEBUG:
+        log.info(f"fichaje: (debug) respuesta del servidor: Resultado={_limpia(resultado)[:60]!r} "
+                 f"Descripcion={_limpia(str(j.get('Descripcion')))[:300]!r}")
+    if resultado.upper() != "OK":
+        return False, "la web no lo ha aceptado"
+    # comprobacion: la ficha debe mostrar ahora la hora de esos ninos. Si no, NO se reintenta el POST.
+    campo_hora = "salida" if salida else "entrada"
     try:
         _, info2 = estado(st)
-        horas = {a["id"]: a["entrada"] for a in info2.get("alumnos") or []}
+        horas = {a["id"]: a[campo_hora] for a in info2.get("alumnos") or []}
         faltan = [a for a in pendientes if not horas.get(a)]
     except Exception as e:
         log.error(f"fichaje: no pude releer la ficha tras fichar: {_err(e)}")
-        faltan = pendientes
+        horas, faltan = {}, pendientes
     if faltan:
-        raise FichajeNoTransitorio("la web dice OK pero la ficha no muestra la entrada, míralo tú")
+        raise FichajeNoTransitorio(f"la web dice OK pero la ficha no muestra la {campo_hora}, míralo tú")
+    info["horas_" + campo_hora] = sorted(h for a, h in horas.items() if a in pendientes and h)
     _borra_debug_html()
     n = len(pendientes)
-    return True, f"{desc} ({n} niño{'s' if n != 1 else ''}, entrada comprobada en la ficha)"
+    return True, f"{n} niño{'s' if n != 1 else ''}, {campo_hora} comprobada en la ficha"
 
 
 # ── Telegram (bot propio) ─────────────────────────────────────────────────────
@@ -570,6 +614,8 @@ def _con_base(st, linea):
 
 BOTONES = [{"text": "✅ Sí, ficha", "callback_data": "fichar_si"},
            {"text": "❌ No, hoy no", "callback_data": "fichar_no"}]
+BOTONES_SALIDA = [{"text": "✅ Sí, ficha la salida", "callback_data": "salida_si"},
+                  {"text": "❌ No, hoy no", "callback_data": "salida_no"}]
 BOTONES_TEST = [{"text": "✅ Sí (prueba)", "callback_data": "test_si"},
                 {"text": "❌ No (prueba)", "callback_data": "test_no"}]
 
@@ -583,6 +629,7 @@ def _nuevo_dia(st, hoy):
     de dias anteriores: un boton viejo NUNCA debe casar con la pregunta de hoy."""
     if st.get("si_pendiente") and st.get("answer_date") != hoy:
         _cerrar_si_pendiente(st)
+    _nuevo_dia_salida(st, hoy)
     if st.get("asked_date") != hoy:
         st["asked_date"] = hoy
         st["asked_msg_ids"] = []
@@ -720,6 +767,8 @@ def _procesar_callback(st, cb, now=None):
         save_state(st)
         log.info(f"fichaje: prueba de botones OK ({data})")
         return
+    if data in ("salida_si", "salida_no"):
+        return _callback_salida(st, cb, msg, data, quien, hhmm, now, hoy)
     if data not in ("fichar_si", "fichar_no"):
         return _caducada(cb, msg_id, f"callback desconocido {data[:20]!r}")
     # validez: pregunta de hoy, este mensaje, sin respuesta previa, dentro de la ventana
@@ -754,6 +803,16 @@ def _procesar_callback(st, cb, now=None):
         _answer(cb["id"], "No puedo guardar el estado, no ficho; lo reintento cuando pueda.")
         log.error("fichaje: Si recibido pero el estado no se guarda; no ficho hasta poder escribir")
         return "reintentar"
+    if st.get("done_date") == hoy:
+        # la entrada ya se dio por hecha (relectura del recordatorio): se cierra la pregunta sin fichar
+        st["answer"], st["answer_date"] = "si", hoy
+        st["si_pendiente"], st["si_msg_id"], st["si_quien"] = False, msg_id, quien
+        _answer(cb["id"], "Ya constaba")
+        st["si_texto_base"] = _texto_pulsado(msg, f"→ Sí ({quien}) · {hhmm}")
+        _quitar_botones(otros)
+        log.info("fichaje: respuesta SI, pero la entrada ya constaba")
+        _intentar_fichar(st, now, hoy)
+        return
     _answer(cb["id"], "Fichando…")
     st["si_texto_base"] = _texto_pulsado(msg, f"→ Sí ({quien}) · {hhmm}")
     _edit(msg_id, st["si_texto_base"] + "\n⏳ fichando…")      # quita los botones al momento
@@ -772,12 +831,21 @@ def _intentar_fichar(st, now, hoy):
     de ENTRADA de esos ninos (hecho=True). Estructura vista de verdad el 23-sep; el caso "sin
     entrada todavia" (sin <li>Entrada:>) es una suposicion razonable, no se ha visto."""
     quien = st.get("si_quien") or "alguien"
+    info = {}
     if st.get("done_date") == hoy:
-        ok, texto = True, "ya constaba la entrada de hoy"
+        # ya se dio por hecha (p. ej. la relectura del recordatorio): «Ya constaba», no «Entrada fichada»
+        _ya_constaba(st, hoy, {}, "entrada", hora=st.get("entrada_constaba_hora"))
+        return True
     else:
         try:
+            # REVALIDACION: justo antes del POST se relee la ficha web en vivo (sin cache). Si ya
+            # consta la entrada (alguien la ficho en la puerta), no se ficha. Si no se puede leer,
+            # la excepcion cuenta como fallo pasajero: nunca se ficha a ciegas.
             hecho, info = estado(st)
-            ok, texto = (True, "ya constaba la entrada de hoy") if hecho else fichar(st, info)
+            if hecho:
+                _ya_constaba(st, hoy, info, "entrada")
+                return True
+            ok, texto = fichar(st, info)
         except FichajeNoTransitorio as e:
             # no se arregla reintentando (tipo de registro raro, ficha sin boton, OK sin entrada
             # visible...): se deja el Si, se dice en el mensaje y se avisa a Sistema. Sin mas POST.
@@ -796,9 +864,10 @@ def _intentar_fichar(st, now, hoy):
         st["si_pendiente"] = False
         save_state(st)
         h = _agenda(forzar=True)       # (c) confirmacion informativa; nunca hace fallar el fichaje
-        if h is not None:
-            texto += f"\nagenda: {'entrada ' + h['entrada'] if h.get('entrada') else 'aún sin hora'}"
-        _edit(st.get("si_msg_id"), _con_base(st, f"✅ <b>Entrada fichada</b> ({quien} dijo sí): {texto}"))
+        agenda = f" · agenda: {'entrada ' + h['entrada'] if h.get('entrada') else 'aún sin hora'}" if h else ""
+        horas = (info.get("horas_entrada") if isinstance(info, dict) else None) or []
+        titulo = f"Entrada fichada a las {horas[0]}" if horas else "Entrada fichada"
+        _edit(st.get("si_msg_id"), _con_base(st, f"✅ <b>{titulo}</b> ({quien} dijo sí){agenda}"))
         log.info(f"fichaje: entrada fichada: {texto}")
         return True
     if _fallo(st, now, hoy, texto, tipo="fichar"):
@@ -825,7 +894,10 @@ MAX_ERRORES_DIA = 3
 # Dos contadores con su tope y su pausa (BAJA-6, ronda 3):
 #   err_count / err_until               -> comprobar la web y preguntar (tipo "estado")
 #   err_fichar / err_fichar_until       -> fichar tras un Si (tipo "fichar")
-_CONTADORES = {"estado": ("err_count", "err_until"), "fichar": ("err_fichar", "err_fichar_until")}
+_CONTADORES = {"estado": ("err_count", "err_until"), "fichar": ("err_fichar", "err_fichar_until"),
+               "salida": ("err_salida", "err_salida_until"),               # comprobar/preguntar la salida
+               "fichar_salida": ("err_fsalida", "err_fsalida_until"),      # fichar la salida tras un Si
+               "recordatorio": ("err_recordatorio", "err_recordatorio_until")}   # releer antes de recordar
 
 
 def _en_pausa(st, now, tipo):
@@ -840,10 +912,31 @@ def _fallo(st, now, hoy, desc, tipo="estado"):
     st[kc] = (st.get(kc) or 0) + 1
     st[ku] = (now + timedelta(minutes=10)).isoformat()
     if st[kc] < MAX_ERRORES_DIA:
-        log.error(f"fichaje: fallo al {'fichar' if tipo == 'fichar' else 'comprobar/preguntar'} ({desc}); "
+        que = {"fichar": "fichar", "fichar_salida": "fichar la salida", "salida": "comprobar la salida",
+               "recordatorio": "releer la ficha para el recordatorio"}.get(tipo, "comprobar/preguntar")
+        log.error(f"fichaje: fallo al {que} ({desc}); "
                   f"reintento en 10 min ({st[kc]}/{MAX_ERRORES_DIA})")
         save_state(st)
         return False
+    if tipo == "recordatorio":
+        st["reminded_date"] = hoy                # sin recordatorio hoy; la pregunta sigue viva, sin aviso
+        save_state(st)
+        log.warning(f"fichaje: {st[kc]} fallos releyendo la ficha para el recordatorio ({desc}); hoy no recuerdo")
+        return True
+    if tipo == "salida":
+        st["salida_checked_date"] = hoy          # hoy ya no se pregunta la salida
+        save_state(st)
+        log.error(f"fichaje: {st[kc]} fallos comprobando la salida hoy ({desc}); lo dejo")
+        _avisar(st, f"⚠️ Guardería: no he podido comprobar la salida de hoy tras {MAX_ERRORES_DIA} intentos "
+                    f"({desc}). Míralo tú.")
+        return True
+    if tipo == "fichar_salida":
+        st["si_salida_pendiente"] = False
+        save_state(st)
+        log.error(f"fichaje: {st[kc]} fallos fichando la salida hoy ({desc}); lo dejo")
+        _avisar(st, f"⚠️ Guardería: dijeron que sí, pero no he podido fichar la salida tras "
+                    f"{MAX_ERRORES_DIA} intentos ({desc}). Hay que hacerlo desde la puerta.")
+        return True
     if tipo == "fichar":
         st["si_pendiente"] = False
         save_state(st)
@@ -1021,6 +1114,244 @@ def _asegurar_hilo(now):
     _arrancar_hilo()
 
 
+# ── SALIDA (24-sep-2026): solo recordatorio con pregunta Si/No ────────────────
+# A FICHAJE_HORA_SALIDA (16:45 por defecto), en dia lectivo y durante 3 h: si hay ninos con entrada
+# y sin salida, pregunta «¿La ficho?» con botones propios (salida_si/salida_no), recordatorio a los
+# FICHAJE_RECORDATORIO_MIN, max. 2 preguntas al dia. Nunca ficha sin un Si. Antes del POST relee la
+# ficha (revalidacion) y, tras el POST, exige que la ficha muestre la hora de salida.
+# Estado propio por dia: salida_checked_date (hoy ya no toca), salida_asked_date/_msg_ids/_answer,
+# salida_done_date, si_salida_pendiente. Contadores: "salida" (comprobar) y "fichar_salida".
+def _hora_salida(now):
+    return now.replace(hour=HH_S, minute=MM_S, second=0, microsecond=0)
+
+
+def _hora_de(info, campo):
+    horas = sorted(a[campo] for a in info.get("alumnos") or [] if a.get(campo) and not a.get("ausente"))
+    return (horas[0] if campo == "entrada" else horas[-1]) if horas else None
+
+
+def _nuevo_dia_salida(st, hoy):
+    """Olvida la pregunta de salida de otro dia (sus botones ya no valen) y cierra un Si viejo."""
+    if st.get("salida_asked_date") and st.get("salida_asked_date") != hoy:
+        st["salida_asked_date"], st["salida_msg_ids"], st["salida_answer"] = None, [], None
+        st["salida_answer_date"], st["salida_texto_base"] = None, None
+    if st.get("si_salida_pendiente") and st.get("salida_answer_date") != hoy:
+        st["si_salida_pendiente"] = False
+        log.warning("fichaje: la salida de un dia anterior no se llego a fichar; la cierro")
+
+
+def _ya_constaba(st, hoy, info, que, hora=None):
+    """Revalidacion: alguien ya la ficho (o todos constan ausentes). No se hace nada; se cierra y se dice."""
+    if info.get("todos_ausentes"):
+        linea = "ℹ️ Hoy constan todos como ausentes; no hay nada que fichar"
+        hora = "-"
+    else:
+        hora = hora or _hora_de(info, que) or "?"
+        h = _agenda(forzar=True)
+        extra = f" · agenda: {que} {h[que]}" if h and h.get(que) else ""
+        linea = f"✅ Ya constaba la {que} a las {hora} (alguien la fichó); no hago nada{extra}"
+    if que == "entrada":
+        st["done_date"], st["si_pendiente"] = hoy, False
+        save_state(st)
+        _edit(st.get("si_msg_id"), _con_base(st, linea))
+    else:
+        st["salida_done_date"], st["si_salida_pendiente"] = hoy, False
+        save_state(st)
+        base = st.get("salida_texto_base")
+        _edit(st.get("si_salida_msg_id"), f"{base}\n{linea}" if base else linea)
+    log.info(f"fichaje: {que}: {'todos ausentes' if info.get('todos_ausentes') else 'ya constaba a las ' + hora}; no ficho")
+
+
+def preguntar_salida(st, hoy, info=None, motivo=""):
+    if st.get("salida_q_envios_date") != hoy:
+        st["salida_q_envios_date"], st["salida_q_envios"] = hoy, 0
+    if (st.get("salida_q_envios") or 0) >= MAX_PREGUNTAS_DIA:
+        log.warning(f"fichaje: salida: ya van {MAX_PREGUNTAS_DIA} preguntas hoy; no mando mas")
+        return
+    if info is not None:
+        st["salida_entrada_hora"] = _hora_de(info, "entrada")
+    hora = st.get("salida_entrada_hora")
+    txt = (f"🚪 <b>Guardería: hay entrada ({hora or '?'}) y aún no hay salida fichada.</b>"
+           + (f" ({motivo})" if motivo else "") + "\n¿La ficho?")
+    if st.get("salida_asked_date") == hoy:
+        _quitar_botones(st.get("salida_msg_ids"))
+    else:
+        st["salida_asked_date"], st["salida_msg_ids"], st["salida_answer"] = hoy, [], None
+    save_state(st)
+    try:
+        r = _msg(txt, BOTONES_SALIDA)
+    except Exception as e:
+        if _es_timeout(e):
+            st["salida_q_envios"] = (st.get("salida_q_envios") or 0) + 1
+        elif not st["salida_msg_ids"] and not motivo:
+            st["salida_asked_date"] = None        # la primera pregunta no salio: se reintenta con tope
+        save_state(st)
+        raise
+    st["salida_q_envios"] = (st.get("salida_q_envios") or 0) + 1
+    if r and r.get("message_id"):
+        st["salida_msg_ids"].append(r["message_id"])
+    save_state(st)
+    log.info(f"fichaje: salida: pregunta enviada (msg {r.get('message_id') if r else None})")
+
+
+def _intentar_salida(st, now, hoy):
+    """Tras un Si de salida (o en su reintento): REVALIDA leyendo la ficha en vivo y solo entonces ficha."""
+    quien = st.get("si_salida_quien") or "alguien"
+    base = st.get("salida_texto_base")
+    con_base = lambda linea: f"{base}\n{linea}" if base else linea
+    try:
+        _, info = estado(st)                                      # revalidacion, sin cache
+        if info.get("error") and info.get("error_tipo") == "dni":
+            raise FichajeError(info["error"])
+        if not info.get("pendientes_salida"):
+            if _hora_de(info, "salida"):
+                _ya_constaba(st, hoy, info, "salida")
+                return True
+            raise FichajeNoTransitorio("la ficha ya no muestra a nadie con entrada y sin salida")
+        ok, texto = fichar(st, info, "salida")
+    except FichajeNoTransitorio as e:
+        texto = _err(e).replace("FichajeNoTransitorio ", "")
+        st["si_salida_pendiente"] = False
+        save_state(st)
+        log.error(f"fichaje: salida: no ficho ({texto})")
+        _edit(st.get("si_salida_msg_id"), con_base(f"⚠️ <b>No he fichado la salida</b> ({quien} dijo sí): {texto}\n"
+                                                   "Míralo en la web o hazlo desde la puerta."))
+        _avisar(st, f"⚠️ Guardería (salida): {texto}")
+        return False
+    except Exception as e:
+        ok, texto = False, f"error hablando con la web: {_err(e)}"
+    if ok:
+        st["salida_done_date"], st["si_salida_pendiente"] = hoy, False
+        save_state(st)
+        horas = info.get("horas_salida") or []
+        hora = horas[-1] if horas else "?"
+        h = _agenda(forzar=True)
+        agenda = f" · agenda: {'salida ' + h['salida'] if h.get('salida') else 'aún sin hora'}" if h else ""
+        _edit(st.get("si_salida_msg_id"), con_base(f"✅ <b>Salida fichada a las {hora}</b> ({quien} dijo sí){agenda}"))
+        log.info(f"fichaje: salida fichada ({texto})")
+        return True
+    if _fallo(st, now, hoy, texto, tipo="fichar_salida"):
+        _edit(st.get("si_salida_msg_id"), con_base(f"⚠️ <b>No he podido fichar la salida</b> tras "
+                                                   f"{MAX_ERRORES_DIA} intentos: {texto}\nHabrá que hacerlo desde la puerta."))
+    else:
+        _edit(st.get("si_salida_msg_id"), con_base(f"⏳ Aún no he podido fichar la salida: {texto}\n"
+                                                   f"Lo reintento en 10 min ({st['err_fsalida']}/{MAX_ERRORES_DIA})."))
+    return False
+
+
+def _callback_salida(st, cb, msg, data, quien, hhmm, now, hoy):
+    msg_id = msg.get("message_id")
+    if st.get("salida_asked_date") != hoy:
+        return _caducada(cb, msg_id, "no hay pregunta de salida de hoy")
+    if msg_id not in (st.get("salida_msg_ids") or []):
+        return _caducada(cb, msg_id, "mensaje que no es de la pregunta de salida de hoy")
+    if st.get("salida_answer") is not None:
+        return _caducada(cb, msg_id, f"salida ya respondida ({st.get('salida_answer')})")
+    if not HORA_SALIDA or now >= _hora_salida(now) + VENTANA:
+        return _caducada(cb, msg_id, "salida fuera de la ventana de 3 h")
+    otros = [m for m in st["salida_msg_ids"] if m != msg_id]
+    if data == "salida_no":
+        st["salida_answer"], st["salida_answer_date"] = "no", hoy
+        save_state(st)
+        _answer(cb["id"], "Vale, hoy no se ficha la salida.")
+        _marcar_pulsado(msg, f"→ No, hoy no ({quien}) · {hhmm}")
+        _quitar_botones(otros)
+        log.info("fichaje: salida: respuesta NO")
+        return
+    st["salida_answer"], st["salida_answer_date"] = "si", hoy
+    st["si_salida_pendiente"], st["si_salida_msg_id"], st["si_salida_quien"] = True, msg_id, quien
+    if not save_state(st):
+        st["salida_answer"], st["salida_answer_date"] = None, None
+        st["si_salida_pendiente"], st["si_salida_msg_id"], st["si_salida_quien"] = False, None, None
+        _answer(cb["id"], "No puedo guardar el estado, no ficho; lo reintento cuando pueda.")
+        log.error("fichaje: salida: Si recibido pero el estado no se guarda; no ficho")
+        return "reintentar"
+    _answer(cb["id"], "Compruebo la ficha y ficho la salida…")
+    st["salida_texto_base"] = _texto_pulsado(msg, f"→ Sí ({quien}) · {hhmm}")
+    _edit(msg_id, st["salida_texto_base"] + "\n⏳ fichando la salida…")
+    save_state(st)
+    _quitar_botones(otros)
+    log.info("fichaje: salida: respuesta SI")
+    _intentar_salida(st, now, hoy)
+
+
+def _decidir_salida(st, now, hoy, es_dia_lectivo):
+    if not HORA_SALIDA:
+        return
+    _nuevo_dia_salida(st, hoy)
+    # un Si de salida que no llego a fichar se reintenta (con su tope), aunque pase la ventana
+    if st.get("si_salida_pendiente") and st.get("salida_answer_date") == hoy:
+        if st.get("salida_done_date") == hoy:
+            st["si_salida_pendiente"] = False
+            save_state(st)
+        elif not _en_pausa(st, now, "fichar_salida"):
+            _intentar_salida(st, now, hoy)
+        return
+    if hoy in DIAS_CERRADO or not es_dia_lectivo():
+        return
+    hs = _hora_salida(now)
+    if not (hs <= now < hs + VENTANA) or st.get("salida_done_date") == hoy or st.get("salida_checked_date") == hoy:
+        return
+    if _en_pausa(st, now, "salida"):
+        return
+    if st.get("salida_asked_date") != hoy:
+        # llegada tardia: se mira cada 30 min; si la agenda (cache <= 35 min) tampoco tiene entrada, la
+        # ficha se lee igual pero como mucho cada 60 min (max. 3 lecturas en la ventana de 3 h)
+        recheck, ultima = _iso(st.get("salida_recheck_at")), _iso(st.get("salida_ultima_lectura"))
+        if st.get("salida_recheck_at") and recheck is None:
+            st["salida_recheck_at"] = None            # valor corrupto: se descarta y se mira ya
+        if recheck and recheck.date() == now.date():
+            if now < recheck:
+                return
+            h = _agenda()
+            if (h is not None and not h.get("entrada") and ultima and ultima.date() == now.date()
+                    and now - ultima < timedelta(minutes=60)):
+                st["salida_recheck_at"] = (now + timedelta(minutes=30)).isoformat()
+                save_state(st)
+                log.info("fichaje: salida: la agenda sigue sin entrada; leo la ficha como mucho cada 60 min")
+                return
+        st["salida_ultima_lectura"] = now.isoformat()
+        _, info = estado(st)                          # un fallo sale como excepcion -> _fallo("salida")
+        if info.get("error") and info.get("error_tipo") == "dni":
+            raise FichajeError(info["error"])
+        if info.get("error") and info.get("error_tipo") != "bloqueados":
+            st["salida_checked_date"] = hoy
+            save_state(st)
+            log.warning(f"fichaje: salida: {info['error']}")
+            _avisar(st, f"⚠️ Guardería (salida): {info['error']}")
+        elif info.get("todos_ausentes"):
+            st["salida_checked_date"] = hoy
+            save_state(st)
+            log.info("fichaje: salida: hoy constan todos como ausentes; no pregunto")
+        elif not info.get("con_entrada"):
+            # puede llegar tarde: se vuelve a mirar cada 30 min mientras dure la ventana de 3 h
+            st["salida_recheck_at"] = (now + timedelta(minutes=30)).isoformat()
+            save_state(st)
+            log.info("fichaje: salida: hoy aún no hay entrada; vuelvo a mirar en 30 min")
+        elif not info.get("pendientes_salida"):
+            st["salida_done_date"] = hoy
+            save_state(st)
+            log.info("fichaje: salida: ya estaba registrada; no pregunto")
+        else:
+            preguntar_salida(st, hoy, info)
+    elif (st.get("salida_answer") is None and RECORDATORIO_MIN and st.get("salida_reminded_date") != hoy
+          and now >= hs + timedelta(minutes=RECORDATORIO_MIN)):
+        # si ya la ficharon en la puerta, no se recuerda. Si la ficha no se puede leer, NO se recuerda a
+        # ciegas: la excepcion va a _fallo("salida") -> reintento a los 10 min, tope 3.
+        _, info = estado(st)
+        if info.get("error") and info.get("error_tipo") == "dni":
+            raise FichajeError(info["error"])
+        st["salida_reminded_date"] = hoy
+        if not info.get("error") and not info.get("pendientes_salida"):
+            st["salida_done_date"] = hoy
+            save_state(st)
+            _quitar_botones(st.get("salida_msg_ids"))
+            log.info("fichaje: salida: ya registrada antes del recordatorio; no recuerdo")
+            return
+        save_state(st)
+        preguntar_salida(st, hoy, motivo="recordatorio, sin respuesta")
+
+
 # ── entrada desde el bucle principal del monitor ──────────────────────────────
 def _decidir(st, now, hoy, es_dia_lectivo):
     # 1) Si pendiente: sus reintentos NO dependen de la ventana de 3 h (el Si ya fue valido);
@@ -1070,7 +1401,8 @@ def _decidir(st, now, hoy, es_dia_lectivo):
             st["done_date"] = hoy
             _nuevo_dia(st, hoy)
             save_state(st)
-            log.info("fichaje: la entrada de hoy ya estaba registrada; no pregunto")
+            log.info("fichaje: hoy constan todos como ausentes; no pregunto" if info.get("todos_ausentes")
+                     else "fichaje: la entrada de hoy ya estaba registrada; no pregunto")
         elif info.get("error"):
             # la ficha no deja fichar (sin boton, tipo raro...): no es transitorio
             h = _agenda()
@@ -1096,7 +1428,26 @@ def _decidir(st, now, hoy, es_dia_lectivo):
     elif (st.get("asked_date") == hoy and st.get("answer") is None and RECORDATORIO_MIN
           and st.get("done_date") != hoy and st.get("reminded_date") != hoy
           and now >= hora_pregunta + timedelta(minutes=RECORDATORIO_MIN)):
+        # Antes de recordar se relee la ficha: si ya consta la entrada (fichada en la puerta), se calla.
+        # Si no se puede leer: contador propio "recordatorio" (pausa 10 min, tope 3; al agotarse, WARNING
+        # y sin recordatorio hoy, sin aviso). No toca err_count: la lectura de las 09:00 es otra cosa.
+        if _en_pausa(st, now, "recordatorio"):
+            return
+        try:
+            hecho, info = estado(st)
+            if info.get("error") and info.get("error_tipo") == "dni":
+                raise FichajeError(info["error"])
+        except Exception as e:
+            _fallo(st, now, hoy, _err(e), tipo="recordatorio")
+            return
         st["reminded_date"] = hoy
+        if hecho:
+            st["entrada_constaba_hora"] = _hora_de(info, "entrada")
+            st["done_date"] = hoy
+            save_state(st)
+            _quitar_botones(st.get("asked_msg_ids"))
+            log.info("fichaje: la entrada ya consta antes del recordatorio; no recuerdo")
+            return
         save_state(st)
         preguntar(st, hoy, motivo="recordatorio, sin respuesta")
 
@@ -1112,6 +1463,8 @@ def tick(now, es_dia_lectivo):
             if st.get("err_date") != hoy:
                 st["err_date"] = hoy
                 st["err_count"], st["err_until"], st["err_fichar"], st["err_fichar_until"] = 0, None, 0, None
+                st["err_salida"], st["err_salida_until"], st["err_fsalida"], st["err_fsalida_until"] = 0, None, 0, None
+                st["err_recordatorio"], st["err_recordatorio_until"] = 0, None
             if not _save_ok:
                 save_state(st)                   # reintenta escribir; si sigue fallando, sin botones
         _asegurar_hilo(now)
@@ -1123,6 +1476,10 @@ def tick(now, es_dia_lectivo):
                 _decidir(st, now, hoy, es_dia_lectivo)
             except Exception as e:
                 _fallo(st, now, hoy, _err(e), tipo="estado")
+            try:
+                _decidir_salida(st, now, hoy, es_dia_lectivo)     # nunca bloquea lo demas
+            except Exception as e:
+                _fallo(st, now, hoy, _err(e), tipo="salida")
     except Exception as e:                       # ultimo cinturon: nada de fichaje llega al monitor
         log.error(f"fichaje: error inesperado en tick: {_err(e)}")
 
@@ -1138,12 +1495,25 @@ def _cli(cmd):
         # sin nombres: ids, banderas y horas; padre/centro solo como "presente"
         print(json.dumps({"hecho": hecho, "tipo_web": info.get("tipo_web"), "padre": bool(info.get("padre")),
                           "alumnos": info.get("alumnos"), "pendientes": info.get("pendientes"),
+                          "pendientes_salida": info.get("pendientes_salida"),
                           "error": info.get("error"), "error_tipo": info.get("error_tipo")},
                          ensure_ascii=False, indent=2))
     elif cmd == "fichar":
-        # manual y explicito (lo teclea el usuario): equivale a un Si, SIN pregunta
+        # manual y explicito (lo teclea el usuario): equivale a un Si, SIN pregunta. Revalida antes.
         hecho, info = estado(st)
-        print("ya hecho" if hecho else fichar(st, info))
+        if info.get("todos_ausentes"):
+            print("hoy constan todos como ausentes; no hay nada que fichar")
+        else:
+            print(f"ya constaba la entrada a las {_hora_de(info, 'entrada')}; no hago nada" if hecho else fichar(st, info))
+    elif cmd == "fichar-salida":
+        # igual, para la salida: revalida y solo ficha si hay entrada y falta la salida
+        _, info = estado(st)
+        if not info.get("con_entrada"):
+            print("hoy no hay entrada; no ficho la salida")
+        elif not info.get("pendientes_salida"):
+            print(f"ya constaba la salida a las {_hora_de(info, 'salida')}; no hago nada")
+        else:
+            print(fichar(st, info, "salida"))
     elif cmd == "test-bot":
         r = _msg("🧪 Prueba del bot de fichaje: pulsa un botón; no hace nada real.", BOTONES_TEST)
         hoy = datetime.now().strftime("%Y-%m-%d")
@@ -1164,7 +1534,7 @@ def _cli(cmd):
             cq = u.get("callback_query") or {}
             print(f"  update {u.get('update_id')}: {cq.get('data')!r} en mensaje {(cq.get('message') or {}).get('message_id')}")
     else:
-        print("uso: python fichaje.py estado|fichar|test-bot|poll")
+        print("uso: python fichaje.py estado|fichar|fichar-salida|test-bot|poll")
         return 2
     return 0
 

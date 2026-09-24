@@ -6,6 +6,8 @@ services:
     container_name: guarderia-monitor
     restart: unless-stopped
     env_file: .env
+    # La hora del recordatorio de salida (pregunta Sí/No, nunca automática) va en .env:
+    # FICHAJE_HORA_SALIDA=16:45 (vacío = sin recordatorio). Tras cambiarla: docker compose up -d
     environment:
       # Los datos privados van en ficheros dentro de ./secrets (ver README, paso 5).
       # Si un fichero no existe, se usa la variable del mismo nombre sin _FILE (si la hay).

@@ -7,6 +7,8 @@ lo cuenta por **Telegram**:
 - 🗓️ **Agenda del día**: comidas, siestas, pañales y observaciones, en un solo mensaje que se va actualizando.
 - 🚪 **Fichaje de entrada** (opcional): si a las 9:00 nadie ha fichado la entrada, te pregunta
   «¿Ficho yo la entrada de hoy?» con dos botones. Solo ficha si pulsas **Sí**.
+- 🚪 **Recordatorio de salida**: a las 16:45, si hay entrada y aún no hay salida fichada, te pregunta
+  «¿La ficho?» con los mismos botones. Tampoco ficha nada sin tu **Sí**.
 - ⚠️ **Avisos** si algo falla (contraseña cambiada, la web cambia…), sin repetirse.
 
 Lo que verás en Telegram, por ejemplo:
@@ -161,6 +163,7 @@ Rellena **solo** estas líneas (el resto déjalo como está):
 | `TG_THREAD_AGENDA` | Id del tema de la agenda; ahí llega también la pregunta del fichaje | `453` |
 | `TG_THREAD_SISTEMA` | Id del tema de avisos técnicos | `454` |
 | `FICHAJE_HORA` | Hora a la que pregunta si hay que fichar | `09:00` |
+| `FICHAJE_HORA_SALIDA` | (Opcional) Hora del recordatorio de salida: déjala en 16:45 o vacía para apagarla | `16:45` |
 
 Guarda y cierra.
 
@@ -208,10 +211,11 @@ Responde algo así:
 | Campo | Qué significa |
 |---|---|
 | `hecho` | `true` si todos los niños (no ausentes) ya tienen la entrada de hoy |
-| `tipo_web` | Qué registro propone la web: `1` = entrada |
+| `tipo_web` | Código que trae el botón de la web; se envía tal cual (la web decide si es entrada o salida) |
 | `padre` | `true` si ha encontrado tu ficha de padre/madre |
 | `alumnos` | Cada niño: su id, si está ausente, si su casilla está desactivada y las horas de entrada y salida de hoy |
 | `pendientes` | Ids de los niños a los que falta fichar la entrada |
+| `pendientes_salida` | Ids de los niños con entrada y sin salida |
 | `error` | Vacío si todo va bien; si no, qué pasa (ver «Problemas frecuentes») |
 
 **Prueba completa del muro** (opcional; manda mensajes `🧪 [TEST]` con la última publicación):
@@ -229,9 +233,20 @@ docker compose run --rm -e SELF_TEST=1 guarderia-monitor
     «✅ Entrada fichada». Si algo falla, lo dice y lo reintenta; si no lo consigue, te pide
     que lo hagas en la puerta.
   - **No** (el niño no va, está malito, vacaciones…) → «→ No, hoy no». No se ficha nada.
-  - **Sin respuesta** → te lo recuerda una vez a los 30 minutos. A las 3 horas la pregunta
+  - **Sin respuesta** → te lo recuerda una vez a los 30 minutos (si mientras tanto alguien fichó en la
+    puerta, no te lo recuerda). A las 3 horas la pregunta
     caduca y ya no ficha.
   - Si alguien ya fichó en la puerta, no pregunta.
+- **Salida**: a `FICHAJE_HORA_SALIDA` (16:45 por defecto), en días de cole, si hay entrada y aún no
+  hay salida llega «🚪 Guardería: hay entrada (09:15) y aún no hay salida fichada. ¿La ficho?».
+  - **Sí** → comprueba otra vez la web y ficha: «✅ Salida fichada a las 16:47 (nombre dijo sí) · agenda: salida 16:47»
+    (o «aún sin hora»). Si alguien ya la fichó en la puerta: «✅ Ya constaba la salida…; no hago nada».
+  - **No** → «Vale, hoy no se ficha la salida» y no vuelve a preguntar.
+  - Sin respuesta → un recordatorio a los 30 minutos; a las 3 horas caduca.
+  - Si la salida ya está, no pregunta. Si a esa hora aún no hay entrada (llegada tardía), vuelve a
+    mirar la web cada 30 minutos mientras dure la ventana de 3 horas (cada 60 minutos si la agenda
+    tampoco muestra entrada). Para no tener recordatorio de
+    salida, pon `FICHAJE_HORA_SALIDA=` (vacío) en `.env`.
 - **Cambiar la hora del fichaje u otro ajuste**: edita `.env` y ejecuta
   `docker compose up -d` (no hace falta `--build`).
 
@@ -253,7 +268,7 @@ docker compose run --rm -e SELF_TEST=1 guarderia-monitor
 | En el log: `409 Conflict` | Otro programa escucha el mismo bot (Home Assistant, otra copia del monitor, o el comando `fichaje.py poll`) | Usa un bot solo para el monitor (paso 1). Si era `poll`, es inofensivo. |
 | `Fichaje guarderia: desactivado (faltan secretos)` | Falta `secrets/fichaje_url` o `secrets/fichaje_dni`, o están vacíos | Créalos (paso 5) y `docker compose up -d`. Compruébalo con `ls -l secrets`. |
 | Aviso «la web sigue pidiendo el DNI» | DNI mal escrito, enlace del QR caducado, o falta aceptar las cookies de la web | Revisa el DNI y vuelve a copiar el enlace del QR. Si sigue, mira el recuadro de abajo. |
-| Aviso «la web propone un registro de tipo X, no una entrada» | La web espera otra cosa: normalmente ya hay entrada y toca la salida | No ficha nada. Mira la web de fichajes; si falta la entrada, hazla en la puerta. |
+| Aviso «la web dice OK pero la ficha no muestra la entrada/salida» | La web aceptó el registro pero no lo refleja (o registró otra cosa) | No lo repite. Mira la web de fichajes y corrige en la puerta si hace falta. |
 | Botón contesta «No puedo guardar el estado» | El disco está lleno o la carpeta `data/` no se puede escribir | Libera espacio (`df -h`) y comprueba que existe la carpeta `data/` junto a `docker-compose.yml`. Mientras tanto no ficha (a propósito). |
 | `[TEST] Login en Workandlife FALLÓ` | Usuario o contraseña mal | Entra en la web a mano con esos datos; corrige `secrets/wl_user` o `secrets/wl_pass`. |
 | El test dice `Aulas descubiertas: (ninguna)` | Tu cuenta no tiene aulas en el portal | Compruébalo entrando en la web a mano. |
@@ -298,6 +313,7 @@ fichero no existe, se usa la variable (si la hay).
 | `FICHAJE_BOT_TOKEN` (`_FILE`) | `TG_BOT_TOKEN` | Bot aparte solo para el fichaje (opcional) |
 | `FICHAJE_CHAT_ID` / `FICHAJE_THREAD` | `TG_CHAT_ID` / `TG_THREAD_AGENDA` | Dónde pregunta |
 | `FICHAJE_HORA` | `09:00` | Hora de la pregunta (`HH:MM`; si está mal, 09:00) |
+| `FICHAJE_HORA_SALIDA` | `16:45` | Hora del recordatorio de SALIDA con pregunta Sí/No (`HH:MM`). Vacío = sin recordatorio; mal escrita = 16:45 |
 | `FICHAJE_RECORDATORIO_MIN` | `30` | Minutos hasta el recordatorio (`0` = sin recordatorio) |
 | `FICHAJE_DIAS_CERRADO` | vacío | Días sin cole además de findes y festivos nacionales: `AAAA-MM-DD,AAAA-MM-DD` |
 | `FICHAJE_COOKIES_EXTRA` | vacío | Cookies extra para la web: `nombre=valor;nombre2=valor2` |
@@ -316,9 +332,13 @@ funciona igual. Un secreto ilegible no tumba el monitor: se registra el error y 
 - **Cómo sabe si ya hay entrada**: tras el DNI, la web muestra un bloque por niño con
   `Entrada: HH:MM` y `Salida: HH:MM` cuando ya se han registrado. El día está **hecho** cuando todos
   los niños no ausentes tienen hora de entrada.
-- **Qué ficha**: solo los niños pendientes (sin entrada, no ausentes, con la casilla activa). Envía lo
-  mismo que el navegador: la casilla de cada niño (`chk_<id>`), el padre, el centro y `tipo=1`.
-  La web decide el tipo de registro (`tipo_web`); si no es `1` (entrada), no ficha y avisa.
+- **Qué ficha**: solo los niños pendientes (sin entrada, no ausentes, con la casilla activa; para la
+  salida, los que tienen entrada y no salida). Envía lo mismo que el navegador: la casilla de cada niño
+  (`chk_<id>`), el padre, el centro y `tipo` = el código que trae el botón (`data-p3`), tal cual.
+  El tipo de registro lo decide la web por el estado del día: el botón trae siempre un código
+  (`tipo_web`, medido: `1` tanto sin entrada como con ella) y se envía tal cual. Por eso lo que
+  cuenta es la comprobación posterior: tras la entrada, que salga la hora de entrada; tras la
+  salida, la de salida.
 - **Segunda fuente, la agenda**: la agenda del día trae un apartado «Horario» («Entrada: No disponible»
   o la hora). No se envía a Telegram, pero el fichaje lo usa:
   - si la ficha de fichajes no se puede leer, la agenda decide: con hora de entrada, el día está hecho
@@ -332,9 +352,18 @@ funciona igual. Un secreto ilegible no tumba el monitor: se registra el error y 
 - **Reintentos con tope**: web caída o que sigue pidiendo el DNI → hasta 3 intentos con 10 min de
   pausa; solo al tercero avisa. Un «Sí» que no llega a fichar se reintenta con su propio tope de 3,
   y si cambia el día sin conseguirlo, lo dice.
+- **Salida, solo con pregunta**: a `FICHAJE_HORA_SALIDA` y durante 3 h, si hay niños con entrada y sin
+  salida, pregunta (con un recordatorio, máximo 2 preguntas al día). Nunca ficha la salida sin un «Sí».
+  Tras el POST, la ficha debe mostrar la hora de salida (si no, avisa y no repite). Los fallos pasajeros
+  se reintentan hasta 3 veces con 10 min de pausa; al rendirse, avisa en Sistema.
+- **Revalidación antes de fichar (entrada y salida)**: al llegar el «Sí», y en cada reintento, vuelve a
+  leer la ficha de la web justo antes de enviar nada. Si ya consta (alguien fichó en la puerta), no ficha
+  y lo dice: «✅ Ya constaba la entrada/salida a las HH:MM (alguien la fichó); no hago nada». Si en ese
+  momento la ficha no se puede leer, cuenta como fallo pasajero y reintenta: nunca ficha a ciegas.
 - **Sin estado guardado no ficha**: si no puede escribir en `/data`, contesta al botón y espera.
 - La pregunta sale como mucho 2 veces al día. Los avisos que no llegan se reintentan hasta 3 veces.
-- **Privacidad**: la pregunta dice cuántos niños faltan, nunca nombres. Los errores se registran
+- **Privacidad**: la pregunta dice cuántos niños faltan, nunca nombres. La descripción que devuelve la
+  web al fichar (puede llevar nombres) no se envía a Telegram ni al log (solo con `FICHAJE_DEBUG=1`). Los errores se registran
   sin URLs ni tokens (se enmascaran `bot<token>`, `?p=` y la sesión de la agenda).
 - **Un solo bot**: el mismo bot envía muro, agenda y avisos, y escucha los botones del fichaje en
   un hilo propio (así responden al momento).
@@ -347,7 +376,9 @@ Dentro del contenedor (`docker compose exec guarderia-monitor python fichaje.py 
 - `test-bot`: manda una pregunta de prueba; sus botones no hacen nada real.
 - `poll`: **solo lectura**; lista los botones pendientes sin procesarlos. Con el monitor en marcha
   puede responder `error: HTTPError HTTP 409` (dos programas escuchando el mismo bot): es inofensivo.
-- `fichar`: **ficha ya, sin preguntar**. Es un «Sí» tuyo explícito; úsalo solo si de verdad quieres fichar.
+- `fichar`: **ficha ya la entrada, sin preguntar**. Es un «Sí» tuyo explícito; úsalo solo si de verdad quieres fichar.
+  Antes relee la ficha: si ya consta la entrada, no hace nada.
+- `fichar-salida`: lo mismo para la salida (solo si hay entrada y falta la salida).
 
 Si un comando falla, solo imprime el tipo de error (`error: ConnectionError`, `error: HTTPError HTTP 400`…).
 

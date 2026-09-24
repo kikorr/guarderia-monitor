@@ -137,22 +137,19 @@ c2 = F._parse_ficha(ficha([{"id": "4101", "entrada": "08:50"}, {"id": "4102", "a
 res("(6c') el unico presente con entrada y el otro ausente -> hecho True", c2["hecho"] is True)
 
 d = F._parse_ficha(ficha([{"id": "4101"}], p3="2")); d["centro"] = "C1"
-sent.clear()
-try:
-    F.fichar(F.load_state(), d); lanzo = None
-except F.FichajeNoTransitorio as e:
-    lanzo = F._err(e)
-res(f"(6d) tipo_web 2 -> error_tipo {d['error_tipo']}, fichar no hace POST ({lanzo})",
-    d["error_tipo"] == "tipo" and lanzo and "tipo 2" in lanzo and not sent)
-# y en el flujo de las 09:00: aviso y dia marcado, sin pregunta
+F.estado = lambda st: (True, dict(F._parse_ficha(ficha([{"id": "4101", "entrada": "09:01"}], p3="2")), centro="C1"))
+sent.clear(); ok, txt = F.fichar(F.load_state(), d)
+res(f"(6d) data-p3=2 ya no bloquea: sin error, envia tipo=2 tal cual y comprueba la entrada ({enviado()})",
+    d["error"] is None and ok and ("tipo", "2") in enviado() and "entrada comprobada" in txt)
+# y en el flujo de las 09:00: con data-p3=2 se pregunta igual (la web decide el tipo)
 os.remove("/tmp/f.json"); F._ST = None; F._save_ok = True
 st = F.load_state(); st["tg_primed"] = True; F.save_state(st); F._ST = None
 F.estado = lambda st: (False, dict(F._parse_ficha(ficha([{"id": "4101"}], p3="2")), centro="C1"))
 calls.clear()
 for m in range(0, 50): F.tick(now.replace(minute=m), lambda: True)
-envios = [b.get("text", "") for m, b in calls if m == "sendMessage"]
-res(f"(6d') a las 09:00 con tipo 2: 1 aviso, ninguna pregunta ({[e[:60] for e in envios]})",
-    len(envios) == 1 and "tipo 2" in envios[0] and not any(b.get("reply_markup") for m, b in calls if m == "sendMessage"))
+envios = [b for m, b in calls if m == "sendMessage"]
+res(f"(6d') a las 09:00 con data-p3=2: pregunta normal, sin aviso de tipo ({[e.get('text','')[:40] for e in envios]})",
+    len(envios) >= 1 and envios[0].get("reply_markup") and not any("tipo" in e.get("text", "") for e in envios))
 
 e = F._parse_ficha(ficha([{"id": "4101"}], btn=False))
 res(f"(6e) sin #btn_alu -> error botones ({e['error']})", e["error_tipo"] == "botones" and not e["hecho"])

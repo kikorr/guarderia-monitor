@@ -1381,7 +1381,8 @@ def main():
     next_evening = next_evening_sweep() if EVENING_MURO_HOUR else None
     next_prune = datetime.now() + timedelta(minutes=5)
 
-    log.info(f"Fichaje guarderia: {'ACTIVO a las ' + fichaje.HORA if fichaje.ENABLED else 'desactivado (faltan secretos)'}")
+    log.info(f"Fichaje guarderia: {'ACTIVO a las ' + fichaje.HORA if fichaje.ENABLED else 'desactivado (faltan secretos)'}"
+             + (f"; pregunta de salida a las {fichaje.HORA_SALIDA}" if fichaje.ENABLED and fichaje.HORA_SALIDA else ""))
     log.info(
         f"Scheduler: muro ~{MURO_INTERVAL[0]}-{MURO_INTERVAL[1]}min, "
         f"agenda ~{AGENDA_INTERVAL[0]}-{AGENDA_INTERVAL[1]}min, {WORK_HOUR_START:02d}:00-{WORK_HOUR_END:02d}:00"

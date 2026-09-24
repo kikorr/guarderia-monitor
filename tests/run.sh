@@ -22,13 +22,17 @@ run() {  # run <fichero> [opciones de docker run...]
   fi
 }
 
-VIEJAS=(-e FICHAJE_HILO=0 -e TG_BOT_TOKEN=x -e TG_CHAT_ID=1 -e WL_USER=x -e WL_PASS=x)
+# FICHAJE_HORA_SALIDA= (vacia): el recordatorio de salida (16:45 por defecto) solo se prueba en test_salida.py;
+# asi las demas suites no dependen de la hora real a la que se ejecuten.
+SIN_SALIDA=(-e FICHAJE_HORA_SALIDA=)
+VIEJAS=(-e FICHAJE_HILO=0 -e TG_BOT_TOKEN=x -e TG_CHAT_ID=1 -e WL_USER=x -e WL_PASS=x "${SIN_SALIDA[@]}")
 run test_fichaje.py   "${VIEJAS[@]}"
 run test_fichaje2.py  "${VIEJAS[@]}"
 run test_fichaje3.py  "${VIEJAS[@]}"
-run test_bot_unico.py
-run test_agenda.py
-run test_hilo.py
+run test_bot_unico.py "${SIN_SALIDA[@]}"
+run test_agenda.py   "${SIN_SALIDA[@]}"
+run test_salida.py
+run test_hilo.py     "${SIN_SALIDA[@]}"
 
 echo
 if [ ${#fallidos[@]} -eq 0 ]; then
