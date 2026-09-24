@@ -365,6 +365,10 @@ funciona igual. Un secreto ilegible no tumba el monitor: se registra el error y 
 - **Privacidad**: la pregunta dice cuántos niños faltan, nunca nombres. La descripción que devuelve la
   web al fichar (puede llevar nombres) no se envía a Telegram ni al log (solo con `FICHAJE_DEBUG=1`). Los errores se registran
   sin URLs ni tokens (se enmascaran `bot<token>`, `?p=` y la sesión de la agenda).
+- **Siempre el mismo padre/madre**: la primera vez que lee la ficha con el DNI guarda el identificador del
+  padre/madre (`padre_id` en `/data/fichaje.json`). Si una lectura posterior devuelve otra ficha (o la
+  cookie del servidor apunta a otra persona u otro centro), no ficha y avisa. Si cambias de cuenta o de
+  DNI, para el monitor, borra la clave `padre_id` de `/data/fichaje.json` y arráncalo otra vez.
 - **Un solo bot**: el mismo bot envía muro, agenda y avisos, y escucha los botones del fichaje en
   un hilo propio (así responden al momento).
 

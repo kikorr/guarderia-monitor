@@ -1,5 +1,5 @@
 """Ficha sintetica con la MISMA estructura que la real (23-sep-2026) y datos inventados."""
-def ficha(ninos, btn=True, p3="1", pide_dni=False):
+def ficha(ninos, btn=True, p3="1", pide_dni=False, padre="P1"):
     if pide_dni:
         return "<div>Para continuar introduce tu DNI</div><input id='dni' name='dni'>"
     cajas = []
@@ -19,7 +19,7 @@ def ficha(ninos, btn=True, p3="1", pide_dni=False):
             </label>
         </div>''')
     boton = (f'<button id="btn_alu" type="button" class="btn btn-primary" data-fn="guardaAccesoAlumno" '
-             f'data-p1="P1" data-p2="C1" data-p3="{p3}">Realizar registro</button>') if btn else ""
+             f'data-p1="{padre}" data-p2="C1" data-p3="{p3}">Realizar registro</button>') if btn else ""
     return f'''
     <div class="mb-3">Hola PERSONA INVENTADA</div>
     <div class="mb-2 text-center fw-bold"><span id="alu_sel">{len(ninos)}</span> de {len(ninos)} niños/as seleccionados</div>

@@ -201,7 +201,7 @@ def load_state():
          "err_fichar": 0, "err_fichar_until": None, "q_date": None, "q_envios": 0,
          "aviso_pendiente": None, "nota_pregunta": None, "discrepancia_date": None,
          "salida_checked_date": None, "salida_recheck_at": None, "salida_ultima_lectura": None,
-         "err_recordatorio": 0, "err_recordatorio_until": None, "entrada_constaba_hora": None, "salida_done_date": None, "salida_asked_date": None,
+         "padre_id": None, "err_recordatorio": 0, "err_recordatorio_until": None, "entrada_constaba_hora": None, "salida_done_date": None, "salida_asked_date": None,
          "salida_msg_ids": [], "salida_answer": None, "salida_answer_date": None, "salida_reminded_date": None,
          "salida_q_envios": 0, "salida_entrada_hora": None, "si_salida_pendiente": False,
          "si_salida_msg_id": None, "si_salida_quien": None, "salida_texto_base": None,
@@ -374,8 +374,16 @@ def _tiene_alumnos(html):
 
 
 def _pide_dni(html):
-    return ('name="dni"' in html or "name='dni'" in html or 'id="dni"' in html
-            or "comprobarPadreValido" in html or "introduce tu DNI" in html)
+    """Formulario del DNI de verdad (no texto suelto ni scripts): input[name=dni], input#dni o un
+    elemento con data-fn=comprobarPadreValido."""
+    soup = BeautifulSoup(html, "html.parser")
+    return bool(soup.find("input", attrs={"name": "dni"}) or soup.find("input", id="dni")
+                or soup.find(attrs={"data-fn": "comprobarPadreValido"}))
+
+
+# Ultima ruta usada por _ficha_padre (la lee estado() justo despues, bajo el mismo lock):
+# {"ruta": "cookie"|"DNI"|"directa", "id_user": idUser enviado por la ruta cookie o None}
+_ultima_ruta = {"ruta": None, "id_user": None}
 
 
 def _ficha_padre(st, s, centro):
@@ -392,19 +400,29 @@ def _ficha_padre(st, s, centro):
     r = s.post(_base() + "/fichajes_padres/pages/compruebaUser.php", data={"id": centro}, timeout=30)
     r.raise_for_status()
     html = r.text
-    ruta = "directa"
+    ruta, id_user = "directa", None
     m = _RE_TIENE_COOKIE.search(html)
+    if m and m.group(2) != str(centro):
+        # la cookie apunta a otro centro que el del QR: no se usa (sin ids en el log)
+        log.warning("fichaje: la cookie del servidor es de otro centro distinto al del QR; uso el DNI")
+        m = None
     if m:
-        r = s.post(url_padre, data={"idUser": m.group(1), "idCentro": m.group(2), "tipo": m.group(3)}, timeout=30)
-        r.raise_for_status()
-        html, ruta = r.text, "cookie"
-        if not _tiene_alumnos(html):
-            log.warning("fichaje: la ficha vía cookie viene sin alumnos; pruebo vía DNI")
+        try:
+            r = s.post(url_padre, data={"idUser": m.group(1), "idCentro": m.group(2), "tipo": m.group(3)}, timeout=30)
+            r.raise_for_status()
+            html, ruta, id_user = r.text, "cookie", m.group(1)
+            if not _tiene_alumnos(html):
+                log.warning("fichaje: la ficha vía cookie viene sin alumnos; pruebo vía DNI")
+        except requests.HTTPError as e:
+            # solo el fallo de ESTE POST: se cae a la ruta del DNI
+            log.warning(f"fichaje: la ficha vía cookie falló ({_err(e)}); pruebo vía DNI")
+            html, ruta, id_user = "", "cookie-fallida", None
     if (ruta != "cookie" or not _tiene_alumnos(html)) and (_pide_dni(html) or not _tiene_alumnos(html)):
         r = s.post(url_padre, data={"dni": DNI, "idCentro": centro}, timeout=30)
         r.raise_for_status()
-        html, ruta = r.text, "DNI"
+        html, ruta, id_user = r.text, "DNI", None
     log.info(f"fichaje: ficha vía {ruta}")
+    _ultima_ruta.update(ruta=ruta, id_user=id_user)
     _keep_cookies(st, s)
     _debug_html(html)
     return html
@@ -460,7 +478,7 @@ def _parse_ficha(html):
     info["pendientes_salida"] = [a["id"] for a in presentes if a["entrada"] and not a["salida"] and not a["disabled"]]
     info["con_entrada"] = sum(1 for a in presentes if a["entrada"])
     info["todos_ausentes"] = bool(info["alumnos"]) and not presentes
-    if "DNI" in texto and "introduce" in texto.lower():
+    if "DNI" in texto and "introduce" in texto.lower() and not info["alumnos"]:
         info["error_tipo"] = "dni"
         info["error"] = "la web sigue pidiendo el DNI: ¿DNI incorrecto, sesion del QR caducada o falta aceptar las cookies (FICHAJE_COOKIES_EXTRA)?"
     elif not info["alumnos"]:
@@ -481,12 +499,36 @@ def _parse_ficha(html):
     return info
 
 
+def _cotejar_padre(st, info):
+    """Nunca fichar con un padre distinto del esperado. (a) Ruta cookie: el data-p1 del boton debe ser
+    el idUser que se envio. (b) padre_id: se guarda la primera vez que se ve un data-p1 por la ruta
+    del DNI; despues, cualquier data-p1 distinto es un error NO transitorio. Si se cambia de cuenta,
+    hay que borrar padre_id de fichaje.json a mano."""
+    p1 = str(info.get("padre") or "")
+    if info.get("error") or not p1:
+        return
+    enviado = _ultima_ruta.get("id_user")
+    guardado = st.get("padre_id")
+    if (enviado and p1 != str(enviado)) or (guardado and p1 != str(guardado)):
+        info["error_tipo"] = "padre"
+        info["error"] = "la ficha devuelta no corresponde al padre esperado; no ficho"
+        info["hecho"] = False
+        log.error("fichaje: la ficha devuelta no corresponde al padre esperado (sin ids en el log)")
+        return
+    if not guardado and _ultima_ruta.get("ruta") == "DNI":
+        st["padre_id"] = p1
+        save_state(st)
+        log.info("fichaje: padre de la ficha registrado (primera lectura por DNI)")
+
+
 def estado(st):
     """Consulta la web. Devuelve (hecho, info). hecho=True si todos los ninos no ausentes tienen entrada."""
     s = _session(st)
     centro = _login(st, s)
+    _ultima_ruta.update(ruta=None, id_user=None)
     info = _parse_ficha(_ficha_padre(st, s, centro))
     info["centro"] = centro
+    _cotejar_padre(st, info)
     hecho = bool(info["hecho"]) and not info["error"]
     st["last_estado"] = {"cuando": datetime.now().isoformat(timespec="seconds"), "hecho": hecho,
                          "alumnos": len(info["alumnos"]), "pendientes": len(info["pendientes"]),
@@ -1432,6 +1474,12 @@ def _decidir(st, now, hoy, es_dia_lectivo):
             save_state(st)
             log.info("fichaje: hoy constan todos como ausentes; no pregunto" if info.get("todos_ausentes")
                      else "fichaje: la entrada de hoy ya estaba registrada; no pregunto")
+        elif info.get("error_tipo") == "padre":
+            _nuevo_dia(st, hoy)
+            st["reminded_date"] = hoy
+            save_state(st)
+            _avisar(st, f"⚠️ Guardería (fichaje): {info['error']}. Revísalo (si has cambiado de cuenta, borra "
+                        "padre_id de /data/fichaje.json).")
         elif info.get("error"):
             # la ficha no deja fichar (sin boton, tipo raro...): no es transitorio
             h = _agenda()
@@ -1470,6 +1518,10 @@ def _decidir(st, now, hoy, es_dia_lectivo):
             _fallo(st, now, hoy, _err(e), tipo="recordatorio")
             return
         st["reminded_date"] = hoy
+        if info.get("error_tipo") == "padre":
+            save_state(st)
+            _avisar(st, f"⚠️ Guardería (fichaje): {info['error']}; no mando el recordatorio.")
+            return
         if hecho:
             st["entrada_constaba_hora"] = _hora_de(info, "entrada")
             st["done_date"] = hoy
