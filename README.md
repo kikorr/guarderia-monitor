@@ -319,6 +319,14 @@ funciona igual. Un secreto ilegible no tumba el monitor: se registra el error y 
 - **Qué ficha**: solo los niños pendientes (sin entrada, no ausentes, con la casilla activa). Envía lo
   mismo que el navegador: la casilla de cada niño (`chk_<id>`), el padre, el centro y `tipo=1`.
   La web decide el tipo de registro (`tipo_web`); si no es `1` (entrada), no ficha y avisa.
+- **Segunda fuente, la agenda**: la agenda del día trae un apartado «Horario» («Entrada: No disponible»
+  o la hora). No se envía a Telegram, pero el fichaje lo usa:
+  - si la ficha de fichajes no se puede leer, la agenda decide: con hora de entrada, el día está hecho
+    y no pregunta; sin hora, pregunta igual y avisa de que el «Sí» puede fallar;
+  - si la ficha y la agenda no coinciden, manda la ficha y avisa una vez al día en Sistema;
+  - la pregunta incluye la línea «Agenda: entrada …» y, tras fichar, el mensaje dice lo que marca la agenda.
+  La agenda se lee como mucho una vez cada 35 minutos (reutiliza la comprobación periódica) y un fallo
+  suyo nunca bloquea el fichaje.
 - **Comprueba**: tras un «OK» de la web vuelve a leer la ficha. Si no sale la entrada, no repite el
   envío y avisa.
 - **Reintentos con tope**: web caída o que sigue pidiendo el DNI → hasta 3 intentos con 10 min de

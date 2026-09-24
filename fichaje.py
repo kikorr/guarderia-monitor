@@ -183,7 +183,7 @@ def load_state():
     d = {"cookies": {}, "tg_offset": 0, "tg_primed": False,
          "si_pendiente": False, "si_msg_id": None, "si_quien": None, "si_texto_base": None,
          "err_fichar": 0, "err_fichar_until": None, "q_date": None, "q_envios": 0,
-         "aviso_pendiente": None,
+         "aviso_pendiente": None, "nota_pregunta": None, "discrepancia_date": None,
          "asked_date": None, "asked_msg_ids": [], "reminded_date": None,
          "answer": None, "answer_date": None, "done_date": None,
          "err_date": None, "err_count": 0, "err_until": None,
@@ -590,6 +590,58 @@ def _nuevo_dia(st, hoy):
         st["answer_date"] = None
 
 
+# ── 2.ª fuente: el «Horario» de la agenda (24-sep-2026) ───────────────────────
+# monitor.py inyecta aqui su agenda_horario() (sin import circular). None = sin 2.ª fuente: todo
+# funciona como antes. Nada de la agenda puede bloquear el tick ni el fichaje (try/except).
+agenda_horario = None
+
+
+def _agenda(forzar=False):
+    """Horario de hoy segun la agenda, o None si no hay fuente o no se ha podido leer."""
+    fn = agenda_horario
+    if fn is None:
+        return None
+    try:
+        h = fn(forzar=forzar)
+        return h if h and h.get("ok") else None
+    except Exception as e:
+        log.warning(f"fichaje: agenda no disponible ({_err(e)})")
+        return None
+
+
+def _txt_agenda(h):
+    return f"entrada {h['entrada']}" if h.get("entrada") else "entrada no disponible"
+
+
+def _hecho_por_agenda(st, hoy, h, motivo):
+    st["done_date"] = hoy
+    _nuevo_dia(st, hoy)
+    save_state(st)
+    log.info(f"fichaje: hecho según la agenda ({_txt_agenda(h)}); {motivo}")
+
+
+def _comparar_con_agenda(st, hoy, ficha_hecho):
+    """(b) Si la ficha y la agenda no coinciden: WARNING y aviso a Sistema una vez al dia. Manda la
+    ficha web. Si la ficha dice hecho y la agenda no, se relee la agenda (puede ir con retraso)."""
+    try:
+        h = _agenda()
+        if h is None:
+            return None
+        if bool(h.get("entrada")) != ficha_hecho and ficha_hecho:
+            h = _agenda(forzar=True) or h
+        if bool(h.get("entrada")) != ficha_hecho and st.get("discrepancia_date") != hoy:
+            st["discrepancia_date"] = hoy
+            save_state(st)
+            txt = (f"la ficha y la agenda no coinciden: ficha={'entrada hecha' if ficha_hecho else 'sin entrada'}, "
+                   f"agenda={_txt_agenda(h)}")
+            log.warning(f"fichaje: {txt}")
+            _avisar(st, f"⚠️ Guardería (fichaje): {txt}. Mando la ficha web.")
+        return h
+    except Exception as e:
+        log.warning(f"fichaje: comparando con la agenda: {_err(e)}")
+        return None
+
+
 MAX_PREGUNTAS_DIA = 2     # envios de la pregunta con botones por dia (pregunta + recordatorio o reintento)
 
 
@@ -602,8 +654,12 @@ def _es_timeout(e):
 def preguntar(st, hoy, motivo=""):
     n = st.get("pendientes_n")
     cuantos = (f"\n{n} niño{'s' if n != 1 else ''} sin entrada." if isinstance(n, int) and n > 0 else "")
+    h = _agenda()
+    linea_agenda = f"\nAgenda: {_txt_agenda(h)}." if h else ""
+    nota = st.get("nota_pregunta")
+    linea_nota = f"\n{nota[1]}" if isinstance(nota, list) and len(nota) == 2 and nota[0] == hoy else ""
     txt = ("🚪 <b>Guardería: hoy no hay entrada fichada</b>" + (f" ({motivo})" if motivo else "") +
-           cuantos + "\n¿Ficho yo la entrada de hoy? Si no han ido, pulsa No.")
+           cuantos + linea_agenda + linea_nota + "\n¿Ficho yo la entrada de hoy? Si no han ido, pulsa No.")
     if st.get("q_date") != hoy:
         st["q_date"], st["q_envios"] = hoy, 0
     if (st.get("q_envios") or 0) >= MAX_PREGUNTAS_DIA:
@@ -739,6 +795,9 @@ def _intentar_fichar(st, now, hoy):
         st["done_date"] = hoy
         st["si_pendiente"] = False
         save_state(st)
+        h = _agenda(forzar=True)       # (c) confirmacion informativa; nunca hace fallar el fichaje
+        if h is not None:
+            texto += f"\nagenda: {'entrada ' + h['entrada'] if h.get('entrada') else 'aún sin hora'}"
         _edit(st.get("si_msg_id"), _con_base(st, f"✅ <b>Entrada fichada</b> ({quien} dijo sí): {texto}"))
         log.info(f"fichaje: entrada fichada: {texto}")
         return True
@@ -985,23 +1044,53 @@ def _decidir(st, now, hoy, es_dia_lectivo):
         return                                   # pausa tras un fallo, para no martillear
     if st.get("asked_date") != hoy and st.get("done_date") != hoy:
         # un fallo de la web (o que siga pidiendo el DNI) sale como excepcion: tick() lo reintenta
-        # hasta 3 veces con pausa de 10 min y solo al tercero avisa y marca el dia (_fallo)
-        hecho, info = estado(st)
-        if info.get("error") and info.get("error_tipo") == "dni":
-            raise FichajeError(info["error"])
+        # hasta 3 veces con pausa de 10 min y solo al tercero avisa y marca el dia (_fallo).
+        # (a) Con la agenda como respaldo: entrada con hora -> hecho; sin hora -> se pregunta igual
+        #     avisando de que la ficha no se ha leido. Sin agenda: como siempre.
+        try:
+            hecho, info = estado(st)
+            fallo_ficha = FichajeError(info["error"]) if info.get("error") and info.get("error_tipo") == "dni" else None
+        except Exception as e:
+            hecho, info, fallo_ficha = False, {}, e
+        if fallo_ficha is not None:
+            h = _agenda()
+            if h is None:
+                raise fallo_ficha
+            if h.get("entrada"):
+                _hecho_por_agenda(st, hoy, h, f"la ficha web no se ha podido leer ({_err(fallo_ficha)})")
+                return
+            log.warning(f"fichaje: la ficha web no se ha podido leer ({_err(fallo_ficha)}); "
+                        "la agenda dice que no hay entrada: pregunto igual")
+            st["nota_pregunta"] = [hoy, "⚠️ No he podido leer la ficha de fichajes: si pulsas Sí, puede fallar."]
+            st["pendientes_n"] = None
+            preguntar(st, hoy)
+            return
         if hecho:
+            _comparar_con_agenda(st, hoy, True)
             st["done_date"] = hoy
             _nuevo_dia(st, hoy)
             save_state(st)
             log.info("fichaje: la entrada de hoy ya estaba registrada; no pregunto")
         elif info.get("error"):
-            # la ficha no muestra botones: no es transitorio, se avisa y se marca al primer intento
-            _nuevo_dia(st, hoy)
-            st["reminded_date"] = hoy
-            save_state(st)
-            log.warning(f"fichaje: {info['error']}")
-            _avisar(st, f"⚠️ Guardería (fichaje): {info['error']}")
+            # la ficha no deja fichar (sin boton, tipo raro...): no es transitorio
+            h = _agenda()
+            if h is not None and h.get("entrada"):
+                _hecho_por_agenda(st, hoy, h, f"la ficha web no sirve ({info['error']})")
+            elif h is not None:
+                log.warning(f"fichaje: {info['error']}; la agenda dice que no hay entrada: pregunto igual")
+                st["nota_pregunta"] = [hoy, f"⚠️ La ficha de fichajes da un problema ({info['error']}): "
+                                            "si pulsas Sí, puede fallar."]
+                st["pendientes_n"] = len(info.get("pendientes") or []) or None
+                preguntar(st, hoy)
+            else:
+                # sin agenda: se avisa y se marca al primer intento (como antes)
+                _nuevo_dia(st, hoy)
+                st["reminded_date"] = hoy
+                save_state(st)
+                log.warning(f"fichaje: {info['error']}")
+                _avisar(st, f"⚠️ Guardería (fichaje): {info['error']}")
         else:
+            _comparar_con_agenda(st, hoy, False)
             st["pendientes_n"] = len(info.get("pendientes") or [])   # solo el numero, nunca nombres
             preguntar(st, hoy)
     elif (st.get("asked_date") == hoy and st.get("answer") is None and RECORDATORIO_MIN

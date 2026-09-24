@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import zipfile
 import html
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -668,7 +669,7 @@ def get_authed(url, timeout=30):
             resp = session.get(url, timeout=timeout)
             resp.raise_for_status()
         except Exception as e:
-            log.error(f"GET {url} falló: {err_txt(e)}")
+            log.error(f"GET {enmascara(url)} falló: {err_txt(e)}")
             return None
         if _looks_logged_in(resp):
             return resp
@@ -733,7 +734,7 @@ def fetch_aula(aula):
     # Un sid que ya no existe NO da 404: el portal rebota a la home y seguiríamos
     # leyendo el muro equivocado en silencio. Comprobarlo por la URL final.
     if "aula.php" not in resp.url:
-        log.error(f"Aula '{aula['name']}' (sid={aula['sid']}): el portal rebota a {resp.url}")
+        log.error(f"Aula '{aula['name']}' (sid={aula['sid']}): el portal rebota a {enmascara(resp.url)}")
         alert_once(
             f"aula-sid-{aula['sid']}",
             f"⚠️ El aula «{html.escape(aula['name'])}» ya no existe en el portal "
@@ -779,7 +780,7 @@ def update_agenda_url(state, soup, silent=False):
         return
     old_url = state.get("agenda_url")
     if old_url != agenda_url:
-        log.info(f"Agenda URL updated: {agenda_url}")
+        log.info(f"Agenda URL updated: {enmascara(agenda_url)}")
         if old_url and not silent:
             notify_ha("status", message="🔄 URL de agenda actualizada automáticamente.")
     state["agenda_url"] = agenda_url
@@ -1062,6 +1063,96 @@ def parse_agenda(page_html):
     return data
 
 
+# --- Horario de la agenda (24-sep-2026): segunda fuente para el fichaje ---
+# La agenda trae un apartado «Horario»: «Entrada: No disponible / Salida: No disponible» si no se
+# ha fichado, o la hora si si. NO se envia a Telegram (sigue en SKIP_LABELS); solo se lee para que
+# fichaje.py confirme si hay entrada. Nunca se registran nombres ni la URL con la sesion.
+_RE_H_ENTRADA = re.compile(r"Entrada:\s*(\d{1,2}:\d{2})")
+_RE_H_SALIDA = re.compile(r"Salida:\s*(\d{1,2}:\d{2})")
+AGENDA_HORARIO_MAX_MIN = 35          # reutilizar la lectura de la agenda si es de hoy y mas reciente
+_horario_lock = threading.Lock()
+_horario_cache = {}                  # {"fecha","entrada","salida","ok","leido": datetime}
+
+
+def _horario_de_texto(texto):
+    me, ms = _RE_H_ENTRADA.search(texto), _RE_H_SALIDA.search(texto)
+    return {"entrada": me.group(1) if me else None, "salida": ms.group(1) if ms else None,
+            "ok": "Entrada" in texto}
+
+
+def parse_horario(page_html):
+    """Del HTML de la agenda saca {"entrada","salida","ok"}. «No disponible» (o sin hora) -> None;
+    ok=False si la pagina no trae el apartado Horario.
+
+    Estructura real (medida el 24-sep-2026): una pestaña div.tabs-alumno > div.tab.cHorario
+    («Horario», se ignora) y, en div.contenido-info, un div.info-titulo.cHorario > span «Horario»
+    seguido de uno o varios div.info-texto(.corto) HERMANOS («Entrada: …», «Salida: …») hasta el
+    siguiente div.info-titulo. Sin div.info-item alrededor (tambien se acepta si lo hay).
+    Respaldo: el texto plano de div.contenido-info entre «Horario» y la siguiente etiqueta conocida."""
+    soup = BeautifulSoup(page_html, "html.parser")
+    for tit in soup.find_all("div", class_="info-titulo"):
+        span = tit.find("span")
+        etiqueta = (span or tit).get_text(strip=True)
+        if etiqueta != "Horario":
+            continue
+        textos = []
+        for sib in tit.find_next_siblings():
+            clases = sib.get("class") or []
+            if "info-titulo" in clases:
+                break                                   # empieza el apartado siguiente
+            if "info-texto" in clases:
+                textos.append(sib.get_text(" ", strip=True))
+        if textos:
+            return _horario_de_texto(" ".join(textos))
+    cont = soup.find("div", class_="contenido-info")
+    if cont:
+        plano = cont.get_text(" ", strip=True)
+        m = re.search(r"\bHorario\b", plano)
+        if m:
+            resto = plano[m.end():]
+            fin = len(resto)
+            for lab in KNOWN_AGENDA_LABELS - {"Horario"}:
+                k = re.search(r"\b" + re.escape(lab) + r"\b", resto)
+                if k:
+                    fin = min(fin, k.start())
+            return _horario_de_texto(resto[:fin])
+    return {"entrada": None, "salida": None, "ok": False}
+
+
+def _guardar_horario(h, cuando=None):
+    cuando = cuando or datetime.now()
+    with _horario_lock:
+        _horario_cache.clear()
+        _horario_cache.update(h, fecha=cuando.strftime("%Y-%m-%d"), leido=cuando)
+
+
+def agenda_horario(forzar=False, max_min=AGENDA_HORARIO_MAX_MIN):
+    """Horario de hoy segun la agenda: {"entrada": "HH:MM"|None, "salida": "HH:MM"|None,
+    "fecha": "YYYY-MM-DD", "ok": bool}. Reutiliza la ultima lectura (la de check_agenda o la
+    anterior) si es de hoy y tiene menos de max_min minutos; si no, o con forzar, descarga la
+    agenda una vez. Nunca lanza: ante cualquier fallo devuelve ok=False."""
+    ahora = datetime.now()
+    hoy = ahora.strftime("%Y-%m-%d")
+    with _horario_lock:
+        c = dict(_horario_cache)
+    if (not forzar and c.get("fecha") == hoy and c.get("leido")
+            and ahora - c["leido"] < timedelta(minutes=max_min)):
+        return {k: c.get(k) for k in ("entrada", "salida", "fecha", "ok")}
+    try:
+        agenda_url = load_state().get("agenda_url")
+        if not agenda_url:
+            return {"entrada": None, "salida": None, "fecha": hoy, "ok": False}
+        resp = requests.get(agenda_url, timeout=30)
+        resp.raise_for_status()
+        h = parse_horario(resp.content.decode("iso-8859-1"))
+    except Exception as e:
+        log.warning(f"Agenda (horario): no pude leerla: {err_txt(e)}")
+        return {"entrada": None, "salida": None, "fecha": hoy, "ok": False}
+    _guardar_horario(h, ahora)
+    log.info(f"Agenda (horario): entrada={h['entrada'] or 'no disponible'} ok={h['ok']}")
+    return {"entrada": h["entrada"], "salida": h["salida"], "fecha": hoy, "ok": h["ok"]}
+
+
 def report_agenda_changes(state, current, silent=False):
     """Avisa si la web añade campos que el monitor no sabe formatear. Sin esto,
     un renombrado en el portal (p.ej. "Petición de los padres" -> "de las
@@ -1106,7 +1197,7 @@ def check_agenda(state, first_run=False):
         log.warning("No agenda URL available — skipping agenda check")
         return
 
-    log.info(f"Checking agenda: {agenda_url[:80]}...")
+    log.info(f"Checking agenda: {enmascara(agenda_url)[:80]}")
 
     try:
         resp = requests.get(agenda_url, timeout=30)
@@ -1118,6 +1209,10 @@ def check_agenda(state, first_run=False):
 
     current = parse_agenda(page_html)
     previous = state.get("agenda_snapshot", {})
+    try:
+        _guardar_horario(parse_horario(page_html))      # para agenda_horario(): sin otra descarga
+    except Exception as e:
+        log.warning(f"Agenda (horario): no pude interpretarlo: {err_txt(e)}")
     log.info(f"Agenda fields: {list(current.keys())}")
 
     if not current:
@@ -1254,6 +1349,7 @@ def run_self_test():
 
 # --- Main loop ---
 import fichaje  # 23-sep-2026: fichaje de entrada con bot propio (ver fichaje.py)
+fichaje.agenda_horario = agenda_horario   # 24-sep-2026: 2.ª fuente (Horario de la agenda); sin import circular
 
 
 def main():

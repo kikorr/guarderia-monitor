@@ -29,3 +29,38 @@ def ficha(ninos, btn=True, p3="1", pide_dni=False):
       <div id="divInfo"><ul><li>Por defecto están seleccionados todos los niños</li>
       <li>Si ya se ha realizado algún registro sobre alguno niños del listado, la información aparece debajo del nombre</li></ul></div>
     </div>'''
+
+
+def agenda(entrada=None, salida=None, con_horario=True):
+    """Agenda del dia sintetica (misma forma que la real: div.info-item > div.info-titulo > span)."""
+    def item(label, valor):
+        return (f'<div class="info-item"><div class="info-titulo"><span>{label}</span></div>'
+                f'<div class="info-texto"><div>{valor}</div></div></div>')
+    partes = [item("Comida", "Todo"), item("Siesta", "12:30 - 14:10"), item("Observaciones Padres", "NIÑO INVENTADO")]
+    if con_horario:
+        e = entrada or "No disponible"
+        s = salida or "No disponible"
+        partes.append('<div class="info-item"><div class="info-titulo"><span>Horario</span></div>'
+                      f'<div class="info-texto"><div>Entrada: {e}</div><div>Salida: {s}</div></div></div>')
+    return "<html><body>" + "".join(partes) + "</body></html>"
+
+
+def agenda_real(entrada=None, salida=None, con_titulo=True):
+    """Agenda con la estructura REAL medida el 24-sep-2026 (datos inventados): pestaña
+    div.tabs-alumno > div.tab.cHorario, y div.info-titulo.cHorario seguido de dos div.info-texto.corto
+    hermanos, sin div.info-item. con_titulo=False deja solo el texto plano (prueba del respaldo)."""
+    e = entrada or "No disponible"
+    s = salida or "No disponible"
+    tabs = ('<div class="tabs-alumno"><div class="tab cHorario">Horario</div>'
+            '<div class="tab cDesayuno">Desayuno</div><div class="tab cComida">Comida</div></div>')
+    if con_titulo:
+        horario = ('<div class="info-titulo cHorario"><span>Horario</span></div>'
+                   f'<div class="info-texto corto">Entrada: {e}</div>'
+                   f'<div class="info-texto corto">Salida: {s}</div>')
+    else:
+        horario = f'<p>Horario</p><p>Entrada: {e}</p><p>Salida: {s}</p>'
+    resto = ('<div class="info-titulo cDesayuno"><span>Desayuno</span></div>'
+             '<div class="info-texto">Sin datos disponibles</div>'
+             '<div class="info-titulo cComida"><span>Comida</span></div>'
+             '<div class="info-texto">Entrada: 12:00 (texto de otro apartado, no debe contar)</div>')
+    return f'<html><body>{tabs}<div class="contenido-info">{horario}{resto}</div></body></html>'

@@ -27,6 +27,7 @@ run test_fichaje.py   "${VIEJAS[@]}"
 run test_fichaje2.py  "${VIEJAS[@]}"
 run test_fichaje3.py  "${VIEJAS[@]}"
 run test_bot_unico.py
+run test_agenda.py
 run test_hilo.py
 
 echo
