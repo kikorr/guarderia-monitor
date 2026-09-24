@@ -32,6 +32,7 @@ run test_fichaje3.py  "${VIEJAS[@]}"
 run test_bot_unico.py "${SIN_SALIDA[@]}"
 run test_agenda.py   "${SIN_SALIDA[@]}"
 run test_salida.py
+run test_ruta_ficha.py "${SIN_SALIDA[@]}"
 run test_hilo.py     "${SIN_SALIDA[@]}"
 
 echo

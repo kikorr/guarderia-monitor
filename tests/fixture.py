@@ -64,3 +64,14 @@ def agenda_real(entrada=None, salida=None, con_titulo=True):
              '<div class="info-titulo cComida"><span>Comida</span></div>'
              '<div class="info-texto">Entrada: 12:00 (texto de otro apartado, no debe contar)</div>')
     return f'<html><body>{tabs}<div class="contenido-info">{horario}{resto}</div></body></html>'
+
+
+def respuesta_cookie(id_user="55555", id_centro="9", tipo="1"):
+    """compruebaUser.php cuando el servidor ya tiene la cookie del padre (~90 bytes, ids inventados)."""
+    return f'<img src="/images/logo2.png" class="d-none" data-onload="tieneCookie({id_user}, \'{id_centro}\', {tipo});" />'
+
+
+def formulario_dni():
+    """compruebaUser.php cuando no hay cookie: el formulario del DNI."""
+    return ('<form id="fDni"><label>Introduce tu DNI</label><input type="text" id="dni" name="dni">'
+            '<button type="button" data-fn="comprobarPadreValido">Entrar</button></form>')

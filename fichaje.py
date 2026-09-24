@@ -366,16 +366,45 @@ def _login(st, s):
     return centro
 
 
+_RE_TIENE_COOKIE = re.compile(r"tieneCookie\(\s*'?(\d+)'?\s*,\s*'?(\d+)'?\s*,\s*'?(\d+)'?\s*\)")
+
+
+def _tiene_alumnos(html):
+    return bool(BeautifulSoup(html, "html.parser").find("input", class_="chk_alu"))
+
+
+def _pide_dni(html):
+    return ('name="dni"' in html or "name='dni'" in html or 'id="dni"' in html
+            or "comprobarPadreValido" in html or "introduce tu DNI" in html)
+
+
 def _ficha_padre(st, s, centro):
-    """Devuelve el HTML de la ficha del padre (alumnos + botones). Pasa por el DNI si hace falta."""
+    """Devuelve el HTML de la ficha del padre (alumnos + botones).
+
+    compruebaUser.php (id=<centro>) contesta de dos formas (medido el 24-sep-2026):
+      a) si el servidor ya tiene la cookie del padre: ~90 bytes con
+         data-onload="tieneCookie(idUser, 'idCentro', tipo)"; el navegador carga entonces
+         compruebaPadre.php con idUser/idCentro/tipo (SIN dni). Se hace lo mismo.
+      b) si no: el formulario del DNI -> compruebaPadre.php con dni+idCentro (ruta de siempre).
+      c) cualquier otra cosa: se prueba directamente la ruta del DNI (tambien funciona).
+    Si (a) devuelve una ficha sin alumnos, se cae a la ruta del DNI antes de dar error."""
+    url_padre = _base() + "/fichajes_padres/pages/compruebaPadre.php"
     r = s.post(_base() + "/fichajes_padres/pages/compruebaUser.php", data={"id": centro}, timeout=30)
     r.raise_for_status()
     html = r.text
-    if 'id="dni"' in html or "introduce tu DNI" in html:
-        r = s.post(_base() + "/fichajes_padres/pages/compruebaPadre.php",
-                   data={"dni": DNI, "idCentro": centro}, timeout=30)
+    ruta = "directa"
+    m = _RE_TIENE_COOKIE.search(html)
+    if m:
+        r = s.post(url_padre, data={"idUser": m.group(1), "idCentro": m.group(2), "tipo": m.group(3)}, timeout=30)
         r.raise_for_status()
-        html = r.text
+        html, ruta = r.text, "cookie"
+        if not _tiene_alumnos(html):
+            log.warning("fichaje: la ficha vía cookie viene sin alumnos; pruebo vía DNI")
+    if (ruta != "cookie" or not _tiene_alumnos(html)) and (_pide_dni(html) or not _tiene_alumnos(html)):
+        r = s.post(url_padre, data={"dni": DNI, "idCentro": centro}, timeout=30)
+        r.raise_for_status()
+        html, ruta = r.text, "DNI"
+    log.info(f"fichaje: ficha vía {ruta}")
     _keep_cookies(st, s)
     _debug_html(html)
     return html
