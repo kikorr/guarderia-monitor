@@ -601,6 +601,31 @@ def get_session():
     return do_login()
 
 
+_TOKEN_RES = (
+    re.compile(r'name=["\']_token["\'][^>]*?value=["\']([^"\']+)["\']', re.IGNORECASE),
+    re.compile(r'value=["\']([^"\']+)["\'][^>]*?name=["\']_token["\']', re.IGNORECASE),
+)
+
+
+def extract_login_token(page_html):
+    """Valor del <input name="_token"> del formulario de login, o None.
+    01-oct-2026: hasta el 28-sep era numérico y se sacaba con un regex de solo dígitos
+    (r'_token.*?value="(\\d+)"'); ahora es una cadena de 64 caracteres y el login dejó
+    de funcionar. Se lee con BeautifulSoup (sin suponer formato del valor) y, como
+    respaldo, con regex en ambos órdenes de atributos."""
+    try:
+        tag = BeautifulSoup(page_html or "", "html.parser").find("input", {"name": "_token"})
+        if tag is not None and (tag.get("value") or "").strip():
+            return tag["value"].strip()
+    except Exception:
+        pass
+    for rx in _TOKEN_RES:
+        m = rx.search(page_html or "")
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
 def do_login():
     """Login en el portal de familias y devuelve sesion autenticada."""
     global _session
@@ -610,11 +635,13 @@ def do_login():
         # Obtener token CSRF
         resp = s.get(WL_LOGIN_URL + "/", timeout=15)
         resp.raise_for_status()
-        m = re.search(r'_token.*?value="(\d+)"', resp.text)
-        if not m:
-            log.error("Login: no _token found")
+        token = extract_login_token(resp.text)
+        if not token:
+            log.error("Login: no encuentro el campo _token en el formulario de login: "
+                      "la estructura del formulario (fLogin) ha cambiado")
+            alert_once("login-token", "⚠️ Login Workandlife: el formulario de login ha cambiado "
+                       "(no encuentro _token). Hay que revisar do_login().", cooldown_min=360)
             return None
-        token = m.group(1)
 
         # POST login
         r = s.post(WL_LOGIN_URL + "/index.php", data={

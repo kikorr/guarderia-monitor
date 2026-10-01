@@ -34,6 +34,7 @@ run test_agenda.py   "${SIN_SALIDA[@]}"
 run test_salida.py
 run test_ruta_ficha.py "${SIN_SALIDA[@]}"
 run test_hilo.py     "${SIN_SALIDA[@]}"
+run test_login_token.py "${SIN_SALIDA[@]}"
 
 echo
 if [ ${#fallidos[@]} -eq 0 ]; then
