@@ -1395,12 +1395,22 @@ def main():
         check_muro(state, first_run=True)
         state = load_state()
         check_agenda(state, first_run=True)
-        notify_ha("status", message="✅ Monitor guardería iniciado.")
+        # 26-oct-2026 (avisos solo de fallos): el aviso de arranque al tema Servidor va
+        # apagado por defecto; NOTIFY_STARTUP=1 en el entorno lo vuelve a encender.
+        if os.getenv("NOTIFY_STARTUP", "0") == "1":
+            notify_ha("status", message="✅ Monitor guardería iniciado.")
+        else:
+            log.info("Aviso de arranque omitido (NOTIFY_STARTUP != 1)")
     else:
         log.info("Resuming from saved state")
         check_muro(state, first_run=False)
         state = load_state()
-        notify_ha("status", message="🔄 Monitor guardería reiniciado.")
+        # 26-oct-2026 (avisos solo de fallos): el aviso de arranque al tema Servidor va
+        # apagado por defecto; NOTIFY_STARTUP=1 en el entorno lo vuelve a encender.
+        if os.getenv("NOTIFY_STARTUP", "0") == "1":
+            notify_ha("status", message="🔄 Monitor guardería reiniciado.")
+        else:
+            log.info("Aviso de arranque omitido (NOTIFY_STARTUP != 1)")
 
     # Primer check con jitter inicial corto
     next_muro = datetime.now() + random_wait((1, 3))
